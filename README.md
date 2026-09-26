@@ -1,4 +1,3 @@
-```markdown
 # SOS69069 dSOS
 
 An ownerless, ETH-backed bearer-bond and credit-redemption mechanism built on top of the external **SOS69069** reputation ledger. dSOS does **not** issue a transferable ERC-20/721 token — `name()`/`symbol()` exist purely for wallet display. What it actually moves is ETH, locked and released through bonds and credits tied to signed records on the ledger.
