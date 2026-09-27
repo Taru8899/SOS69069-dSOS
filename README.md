@@ -1,6 +1,6 @@
-SOS69069 dSOS
+###SOS69069 dSOS
 
-### Identity
+Identity
 - Name: **"SOS69069 dSOS"**, Symbol: **"dSOS"**.
 - `SOS69069_LEDGER` pinned to `0x7373DBC24Dcd785896E8Ac3d5372c6ced9B75a8A`, immutable.
 
