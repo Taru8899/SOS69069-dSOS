@@ -20,7 +20,9 @@ interface ISOS69069 {
 ///      [MIN_EFFECTIVE, MAX_EFFECTIVE] as an independent anti-hoarding gate.
 ///      Directed-bond principal is ring-fenced in totalEarmarked and always
 ///      paid in full; MIN_RESERVE floors unearmarked funds against gas
-///      reimbursement across all redemption paths.
+///      reimbursement across all redemption paths. Redemption reverts if
+///      pool headroom is too thin to pay any principal at all, rather than
+///      silently burning a credit for a zero payout.
 contract dSOS {
 
     // ============================================================ CONSTANTS
@@ -103,6 +105,11 @@ contract dSOS {
     }
 
     /// @notice Mints `count` common bonds to `mintTo`. Not gas-sponsored.
+    /// @dev Trusts that SOS69069's recordSignatureOne wrote a matching,
+    ///      verified record for every item; this contract does not
+    ///      independently re-verify each signature. Safe against the
+    ///      audited, immutable SOS69069 ledger this is pinned to — would
+    ///      need re-review if ever pointed at a different ledger.
     function donateCommonBatch(address mintTo, uint256 count, bytes32[] calldata payloadHashes, bytes[] calldata signatures, string[] calldata metadatas) external payable {
         require(mintTo != address(0), "mintTo is zero address");
         require(count > 0 && msg.value == UNIT * count, "invalid count/value");
@@ -122,6 +129,7 @@ contract dSOS {
     }
 
     /// @notice Mints `count` directed bonds to `mintTo`. Not gas-sponsored.
+    /// @dev See donateCommonBatch — same trust assumption on recordSignatureOne.
     function donateDirectedBatch(address mintTo, uint256 count, bytes32[] calldata payloadHashes, bytes[] calldata signatures, string[] calldata metadatas) external payable {
         require(mintTo != address(0), "mintTo is zero address");
         require(count > 0 && msg.value == UNIT * count, "invalid count/value");
@@ -180,7 +188,8 @@ contract dSOS {
     // =========================================================== REDEMPTION
 
     /// @notice Relays a bond to `to`; redeems if `to` is the redeem target, else forwards.
-    /// @dev Redemption requires syncCredits(caller) > 0 and effectiveOf(caller) in range.
+    /// @dev Redemption requires syncCredits(caller) > 0, effectiveOf(caller) in range,
+    ///      and non-zero pool headroom (reverts rather than burning a credit for nothing).
     function relay(uint256 bondId, address to, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external {
         uint256 gasStart = gasleft();
 
@@ -191,11 +200,12 @@ contract dSOS {
 
         address redeemTarget = b.earmarked ? msg.sender : SOS69069_LEDGER;
         bool willRedeem = (to == redeemTarget);
-        int256 eff = SOS.effectiveOf(msg.sender);
+        int256 eff;
 
         if (willRedeem) {
             syncCredits(msg.sender);
             require(redemptionCredits[msg.sender] > 0, "no redemption credit");
+            eff = SOS.effectiveOf(msg.sender);
             require(eff >= MIN_EFFECTIVE && eff <= MAX_EFFECTIVE, "effective out of range");
         }
 
@@ -205,7 +215,7 @@ contract dSOS {
             _removeFromHolder(msg.sender, bondId);
             b.holder = to;
             _addToHolder(to, bondId);
-            emit Relayed(bondId, msg.sender, to, eff, false);
+            emit Relayed(bondId, msg.sender, to, 0, false);
             return;
         }
 
@@ -226,6 +236,7 @@ contract dSOS {
             gasPaid = gasCost <= headroom ? gasCost : headroom;
         } else {
             (principalPaid, gasPaid) = _payFromCommonPool(UNIT, gasCost);
+            require(principalPaid > 0, "pool too thin");
         }
 
         emit Redeemed(bondId, payee, redeemTarget, wasEarmarked, principalPaid, gasPaid, gasUsedMeasured);
@@ -239,7 +250,8 @@ contract dSOS {
     }
 
     /// @notice Redeems 1 credit directly for UNIT ETH from the common pool; no bond required.
-    /// @dev Requires redemptionCredits(caller) > 0 and effectiveOf(caller) in range.
+    /// @dev Requires redemptionCredits(caller) > 0, effectiveOf(caller) in range, and
+    ///      non-zero pool headroom (reverts rather than burning a credit for nothing).
     function redeemCredit(bytes32 payloadHash, bytes calldata signature, string calldata metadata) external {
         uint256 gasStart = gasleft();
 
@@ -253,6 +265,7 @@ contract dSOS {
 
         (uint256 gasUsedMeasured, uint256 gasCost) = _gasAccounting(gasStart);
         (uint256 principalPaid, uint256 gasPaid) = _payFromCommonPool(UNIT, gasCost);
+        require(principalPaid > 0, "pool too thin");
 
         emit CreditRedeemed(msg.sender, eff, principalPaid, gasPaid, gasUsedMeasured);
 
@@ -312,7 +325,7 @@ contract dSOS {
     /// @notice True iff user has a spendable credit AND effectiveOf() is within range.
     function isEligible(address user) external view returns (bool) {
         int256 eff = SOS.effectiveOf(user);
-        return eff >= MIN_EFFECTIVE && eff <= MAX_EFFECTIVE && this.pendingCredits(user) > 0;
+        return eff >= MIN_EFFECTIVE && eff <= MAX_EFFECTIVE && _pendingCredits(user) > 0;
     }
 
     /// @notice Raw push, trust, and effective values from the ledger.
@@ -324,6 +337,11 @@ contract dSOS {
 
     /// @notice Live credit balance as of a hypothetical syncCredits call now.
     function pendingCredits(address user) external view returns (uint256) {
+        return _pendingCredits(user);
+    }
+
+    /// @dev Shared by pendingCredits and isEligible to avoid an external self-call.
+    function _pendingCredits(address user) internal view returns (uint256) {
         uint256 currentPush = SOS.pushCountOf(user);
         uint256 currentTrust = SOS.trustCountOf(user);
         uint256 pushDelta = currentPush > lastPush[user] ? currentPush - lastPush[user] : 0;
