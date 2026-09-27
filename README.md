@@ -1,4 +1,4 @@
-###SOS69069 dSOS
+### SOS69069 dSOS
 
 Identity
 - Name: **"SOS69069 dSOS"**, Symbol: **"dSOS"**.
