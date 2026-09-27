@@ -2,8 +2,7 @@
 pragma solidity ^0.8.36;
 
 /// @title ISOS69069
-/// @notice Interface to the deployed SOS69069 ledger. No transferable asset;
-///         only records signed messages and exposes live Trust-Push counters.
+/// @notice External SOS69069 ledger: no transferable asset, only signed records and live Push/Trust counters.
 interface ISOS69069 {
     function recordSignature(address signer, address intendedTo, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external;
     function recordSignatureOne(address signer, address intendedTo, bytes32[] calldata payloadHashes, bytes[] calldata signatures, string[] calldata metadatas) external;
@@ -14,46 +13,46 @@ interface ISOS69069 {
 }
 
 /// @title SOS69069 dSOS
-/// @notice Ownerless bearer-bond mechanism. Common bonds: creation and
-///         redemption records target SOS69069_LEDGER. Directed bonds:
-///         creation targets the recipient (mintTo); redemption targets the
-///         current holder (self); principal always paid in full from
-///         totalEarmarked. A standalone redeemCredit() path also draws UNIT
-///         from the common pool with no bond required, sharing the same
-///         credit balance as common-bond redemption.
-/// @dev Credit accounting: effectiveOf() is clamped to [MIN_EFFECTIVE,
-///      MAX_EFFECTIVE] = [-69069, +69069]. Every sync adds the ABSOLUTE
-///      movement since the last sync into a running cumulative total —
-///      movement in opposite directions ADDS, never cancels (+20 then -80,
-///      synced after each, sums to 100 total = 1 credit, even though net
-///      change is -60). Requires syncCredits to be called between
-///      individual effective changes to count each one; a sync spanning
-///      multiple unobserved changes can only measure their net effect.
-///      MIN_RESERVE floors unearmarked funds against gas reimbursement for
-///      all redemption paths; directed principal bypasses it entirely.
+/// @notice Ownerless ETH-backed bearer bonds and standalone credits, redeemed
+///         only via signed records on the SOS69069 ledger.
+/// @dev Credits accrue from weighted push/trust activity (see syncCredits);
+///      redemption additionally requires effectiveOf() within
+///      [MIN_EFFECTIVE, MAX_EFFECTIVE] as an independent anti-hoarding gate.
+///      Directed-bond principal is ring-fenced in totalEarmarked and always
+///      paid in full; MIN_RESERVE floors unearmarked funds against gas
+///      reimbursement across all redemption paths.
 contract dSOS {
 
-    // ============================================================= CONSTANTS
+    // ============================================================ CONSTANTS
 
+    /// @notice SOS69069 ledger this deployment reads and writes.
     address public constant SOS69069_LEDGER = 0x7373DBC24Dcd785896E8Ac3d5372c6ced9B75a8A;
     ISOS69069 public immutable SOS;
 
     uint256 public constant UNIT = 0.000369 ether;
     uint256 public constant MIN_RESERVE = 0.05 ether;
     uint256 public constant GAS_PER_CALLDATA_BYTE = 16;
-    /// @dev PLACEHOLDER — calibrate against real deployed gas before mainnet deploy.
+
+    /// @dev Placeholder — calibrate against measured deployed gas before mainnet deploy.
     uint256 public constant BASE_GAS_OVERHEAD = 23_500;
 
-    /// @notice Bounds for redemption eligibility AND credit accounting.
+    /// @notice Anti-hoarding redemption window on effectiveOf().
     int256 public constant MIN_EFFECTIVE = -69069;
     int256 public constant MAX_EFFECTIVE = 69069;
+
     uint256 public constant CREDIT_STEP = 100;
+    uint256 public constant PUSH_WEIGHT = 1;
+    uint256 public constant TRUST_WEIGHT = 1;
 
     function name() external pure returns (string memory) { return "SOS69069 dSOS"; }
     function symbol() external pure returns (string memory) { return "dSOS"; }
 
-    // ================================================================ STATE
+    // =============================================================== STATE
 
+    /// @param holder Current owner, entitled to relay.
+    /// @param active False once redeemed.
+    /// @param earmarked True = directed (self-redeemed, protected principal); false = common.
+    /// @param creationRecordHash SOS69069 struct hash of this bond's mint record.
     struct Bond {
         address holder;
         bool active;
@@ -68,18 +67,13 @@ contract dSOS {
     mapping(address => uint256[]) public bondsHeldBy;
     mapping(uint256 => uint256) private _holderIndex;
 
-    /// @notice Last observed (clamped) effectiveOf() value for a user.
-    mapping(address => int256) public lastEffective;
-
-    /// @notice Leftover cumulative absolute movement not yet converted to a
-    ///         credit (0-99). Carries forward across syncs so partial
-    ///         movement is never lost, only pending.
-    mapping(address => uint256) public movementRemainder;
-
-    /// @notice Accumulated, spendable, non-expiring redemption credits.
+    mapping(address => uint256) public lastPush;
+    mapping(address => uint256) public lastTrust;
+    /// @notice Leftover weighted activity (0..CREDIT_STEP-1), carried across syncs.
+    mapping(address => uint256) public activityRemainder;
     mapping(address => uint256) public redemptionCredits;
 
-    // =============================================================== EVENTS
+    // ============================================================== EVENTS
 
     event DonatedCommon(address indexed donor, address indexed mintTo, uint256 startId, uint256 count, uint256 value);
     event DonatedDirected(address indexed donor, address indexed mintTo, uint256 startId, uint256 count, uint256 value);
@@ -87,18 +81,20 @@ contract dSOS {
     event Redeemed(uint256 indexed bondId, address indexed holder, address indexed redeemTarget, bool earmarked, uint256 principalPaid, uint256 gasReimbursed, uint256 gasUsedMeasured);
     event CreditRedeemed(address indexed user, int256 signerEffective, uint256 principalPaid, uint256 gasReimbursed, uint256 gasUsedMeasured);
     event Donation(address indexed from, uint256 amount);
-    event CreditsSynced(address indexed user, uint256 creditsEarned, uint256 totalCredits, int256 observedEffective);
+    event CreditsSynced(address indexed user, uint256 creditsEarned, uint256 totalCredits, uint256 pushCount, uint256 trustCount);
 
     constructor() {
         SOS = ISOS69069(SOS69069_LEDGER);
     }
 
+    /// @notice Plain ETH top-up; no bond minted, just joins the common pool.
     receive() external payable {
         emit Donation(msg.sender, msg.value);
     }
 
-    // ============================================================= MINTING
+    // ============================================================== MINTING
 
+    /// @notice Mints 1 common bond to `mintTo`. Not gas-sponsored.
     function donateCommon(address mintTo, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external payable {
         require(mintTo != address(0), "mintTo is zero address");
         require(msg.value == UNIT, "value must equal UNIT");
@@ -106,6 +102,7 @@ contract dSOS {
         emit DonatedCommon(msg.sender, mintTo, id, 1, msg.value);
     }
 
+    /// @notice Mints `count` common bonds to `mintTo`. Not gas-sponsored.
     function donateCommonBatch(address mintTo, uint256 count, bytes32[] calldata payloadHashes, bytes[] calldata signatures, string[] calldata metadatas) external payable {
         require(mintTo != address(0), "mintTo is zero address");
         require(count > 0 && msg.value == UNIT * count, "invalid count/value");
@@ -115,6 +112,7 @@ contract dSOS {
         emit DonatedCommon(msg.sender, mintTo, startId, count, msg.value);
     }
 
+    /// @notice Mints 1 directed bond to `mintTo`. Not gas-sponsored.
     function donateDirected(address mintTo, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external payable {
         require(mintTo != address(0), "mintTo is zero address");
         require(msg.value == UNIT, "value must equal UNIT");
@@ -123,6 +121,7 @@ contract dSOS {
         emit DonatedDirected(msg.sender, mintTo, id, 1, msg.value);
     }
 
+    /// @notice Mints `count` directed bonds to `mintTo`. Not gas-sponsored.
     function donateDirectedBatch(address mintTo, uint256 count, bytes32[] calldata payloadHashes, bytes[] calldata signatures, string[] calldata metadatas) external payable {
         require(mintTo != address(0), "mintTo is zero address");
         require(count > 0 && msg.value == UNIT * count, "invalid count/value");
@@ -133,7 +132,7 @@ contract dSOS {
         emit DonatedDirected(msg.sender, mintTo, startId, count, msg.value);
     }
 
-    /// @dev Single-bond mint: writes the creation record, stores the bond, indexes it.
+    /// @dev Writes the creation record, stores the bond, indexes it.
     function _mintOne(address mintTo, address intendedTo, bool earmarked, bytes32 payloadHash, bytes calldata signature, string calldata metadata) internal returns (uint256 id) {
         SOS.recordSignature(msg.sender, intendedTo, payloadHash, signature, metadata);
         bytes32 recordHash = SOS.recordStructHash(msg.sender, intendedTo, payloadHash, metadata);
@@ -142,7 +141,7 @@ contract dSOS {
         _addToHolder(mintTo, id);
     }
 
-    /// @dev Batch mint: caller already wrote all records via recordSignatureOne; this just stores bonds.
+    /// @dev Records were already written via recordSignatureOne; this only stores bonds.
     function _mintBatch(address mintTo, address intendedTo, bool earmarked, bytes32[] calldata payloadHashes, string[] calldata metadatas) internal returns (uint256 startId) {
         startId = nextBondId;
         for (uint256 i = 0; i < payloadHashes.length; i++) {
@@ -155,40 +154,33 @@ contract dSOS {
 
     // ============================================================== CREDITS
 
-    /// @dev Clamps a raw effectiveOf() reading into [MIN_EFFECTIVE, MAX_EFFECTIVE].
-    function _clamp(int256 value) internal pure returns (int256) {
-        if (value > MAX_EFFECTIVE) return MAX_EFFECTIVE;
-        if (value < MIN_EFFECTIVE) return MIN_EFFECTIVE;
-        return value;
-    }
-
-    /// @notice Adds |current - lastEffective| (both clamped) to the user's
-    ///         cumulative movement total and converts every full 100 points
-    ///         of TOTAL accumulated movement — summed across all directions
-    ///         and all past syncs — into 1 permanent credit. Opposite-direction
-    ///         moves add together rather than canceling.
-    /// @dev Callable by anyone, anytime. Must be called between individual
-    ///      effective changes to count each one; see contract-level NatSpec.
+    /// @notice Converts weighted push/trust increases since the last sync into credits.
+    /// @dev No-op if neither counter increased. Callable by anyone, anytime.
     function syncCredits(address user) public {
-        int256 current = _clamp(SOS.effectiveOf(user));
-        int256 last = lastEffective[user];
-        uint256 diff = current >= last ? uint256(current - last) : uint256(last - current);
+        uint256 currentPush = SOS.pushCountOf(user);
+        uint256 currentTrust = SOS.trustCountOf(user);
+        uint256 pushDelta = currentPush > lastPush[user] ? currentPush - lastPush[user] : 0;
+        uint256 trustDelta = currentTrust > lastTrust[user] ? currentTrust - lastTrust[user] : 0;
 
-        if (diff > 0) {
-            uint256 total = movementRemainder[user] + diff;
-            uint256 earned = total / CREDIT_STEP;
-            movementRemainder[user] = total % CREDIT_STEP;
-            lastEffective[user] = current;
+        if (pushDelta == 0 && trustDelta == 0) return;
 
-            if (earned > 0) {
-                redemptionCredits[user] += earned;
-                emit CreditsSynced(user, earned, redemptionCredits[user], current);
-            }
+        uint256 total = activityRemainder[user] + pushDelta * PUSH_WEIGHT + trustDelta * TRUST_WEIGHT;
+        uint256 earned = total / CREDIT_STEP;
+
+        activityRemainder[user] = total % CREDIT_STEP;
+        lastPush[user] = currentPush;
+        lastTrust[user] = currentTrust;
+
+        if (earned > 0) {
+            redemptionCredits[user] += earned;
+            emit CreditsSynced(user, earned, redemptionCredits[user], currentPush, currentTrust);
         }
     }
 
-    // ========================================================= RELAY/REDEEM
+    // =========================================================== REDEMPTION
 
+    /// @notice Relays a bond to `to`; redeems if `to` is the redeem target, else forwards.
+    /// @dev Redemption requires syncCredits(caller) > 0 and effectiveOf(caller) in range.
     function relay(uint256 bondId, address to, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external {
         uint256 gasStart = gasleft();
 
@@ -199,13 +191,13 @@ contract dSOS {
 
         address redeemTarget = b.earmarked ? msg.sender : SOS69069_LEDGER;
         bool willRedeem = (to == redeemTarget);
+        int256 eff = SOS.effectiveOf(msg.sender);
 
         if (willRedeem) {
             syncCredits(msg.sender);
             require(redemptionCredits[msg.sender] > 0, "no redemption credit");
+            require(eff >= MIN_EFFECTIVE && eff <= MAX_EFFECTIVE, "effective out of range");
         }
-        int256 eff = SOS.effectiveOf(msg.sender);
-        if (willRedeem) require(eff >= MIN_EFFECTIVE && eff <= MAX_EFFECTIVE, "effective out of range");
 
         SOS.recordSignature(msg.sender, to, payloadHash, signature, metadata);
 
@@ -246,13 +238,15 @@ contract dSOS {
         }
     }
 
+    /// @notice Redeems 1 credit directly for UNIT ETH from the common pool; no bond required.
+    /// @dev Requires redemptionCredits(caller) > 0 and effectiveOf(caller) in range.
     function redeemCredit(bytes32 payloadHash, bytes calldata signature, string calldata metadata) external {
         uint256 gasStart = gasleft();
 
         syncCredits(msg.sender);
+        require(redemptionCredits[msg.sender] > 0, "no redemption credit");
         int256 eff = SOS.effectiveOf(msg.sender);
         require(eff >= MIN_EFFECTIVE && eff <= MAX_EFFECTIVE, "effective out of range");
-        require(redemptionCredits[msg.sender] > 0, "no redemption credit");
 
         SOS.recordSignature(msg.sender, SOS69069_LEDGER, payloadHash, signature, metadata);
         redemptionCredits[msg.sender] -= 1;
@@ -275,7 +269,7 @@ contract dSOS {
         cost = (measured + BASE_GAS_OVERHEAD + msg.data.length * GAS_PER_CALLDATA_BYTE) * tx.gasprice;
     }
 
-    /// @dev Unearmarked balance above MIN_RESERVE — the shared floor-protected headroom.
+    /// @dev Unearmarked balance above MIN_RESERVE.
     function _headroom() internal view returns (uint256) {
         uint256 balance = address(this).balance;
         uint256 unearmarked = balance > totalEarmarked ? balance - totalEarmarked : 0;
@@ -297,47 +291,51 @@ contract dSOS {
         }
     }
 
-    // =============================================================== VIEWS
+    // =================================================================VIEWS
 
     function poolBalance() external view returns (uint256) { return address(this).balance; }
     function commonAvailable() external view returns (uint256) { return _headroom(); }
     function directedGasAvailable() external view returns (uint256) { return _headroom(); }
 
+    /// @notice Address a bond must be relayed to in order to redeem it.
     function redeemTargetOf(uint256 bondId) external view returns (address) {
         Bond storage b = bonds[bondId];
         return b.earmarked ? b.holder : SOS69069_LEDGER;
     }
 
+    /// @notice Whether relaying `bondId` to `to` would redeem it.
     function isRedeemable(uint256 bondId, address to) external view returns (bool) {
         Bond storage b = bonds[bondId];
         return b.active && to == (b.earmarked ? b.holder : SOS69069_LEDGER);
     }
 
+    /// @notice True iff user has a spendable credit AND effectiveOf() is within range.
     function isEligible(address user) external view returns (bool) {
         int256 eff = SOS.effectiveOf(user);
-        return eff >= MIN_EFFECTIVE && eff <= MAX_EFFECTIVE;
+        return eff >= MIN_EFFECTIVE && eff <= MAX_EFFECTIVE && this.pendingCredits(user) > 0;
     }
 
+    /// @notice Raw push, trust, and effective values from the ledger.
     function signerMetrics(address user) external view returns (uint256 push, uint256 trust, int256 effective) {
         push = SOS.pushCountOf(user);
         trust = SOS.trustCountOf(user);
         effective = SOS.effectiveOf(user);
     }
 
-    /// @notice Live view of credits after a sync, using the same cumulative
-    ///         absolute-movement logic as syncCredits. Only reflects movement
-    ///         since the last actual sync — see contract-level NatSpec caveat.
+    /// @notice Live credit balance as of a hypothetical syncCredits call now.
     function pendingCredits(address user) external view returns (uint256) {
-        int256 current = _clamp(SOS.effectiveOf(user));
-        int256 last = lastEffective[user];
-        uint256 diff = current >= last ? uint256(current - last) : uint256(last - current);
-        return redemptionCredits[user] + (movementRemainder[user] + diff) / CREDIT_STEP;
+        uint256 currentPush = SOS.pushCountOf(user);
+        uint256 currentTrust = SOS.trustCountOf(user);
+        uint256 pushDelta = currentPush > lastPush[user] ? currentPush - lastPush[user] : 0;
+        uint256 trustDelta = currentTrust > lastTrust[user] ? currentTrust - lastTrust[user] : 0;
+        uint256 weighted = pushDelta * PUSH_WEIGHT + trustDelta * TRUST_WEIGHT;
+        return redemptionCredits[user] + (activityRemainder[user] + weighted) / CREDIT_STEP;
     }
 
     function bondCountOf(address holder) external view returns (uint256) { return bondsHeldBy[holder].length; }
     function bondIdsOf(address holder) external view returns (uint256[] memory) { return bondsHeldBy[holder]; }
 
-    // ============================================================ INTERNAL
+    // ============================================================== INTERNAL
 
     function _addToHolder(address holder, uint256 bondId) internal {
         bondsHeldBy[holder].push(bondId);
