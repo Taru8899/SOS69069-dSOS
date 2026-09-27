@@ -1,98 +1,115 @@
-### SOS69069 dSOS
+# SOS69069 dSOS
 
-Identity
-- Name: **"SOS69069 dSOS"**, Symbol: **"dSOS"**.
-- `SOS69069_LEDGER` pinned to `0x7373DBC24Dcd785896E8Ac3d5372c6ced9B75a8A`, immutable.
+An ownerless ETH contract with two independent mechanisms, both gated by real signed records on the external **SOS69069** reputation ledger:
 
-### Constants
-- `UNIT = 0.000369 ether` — baseline mode 0 price floor.
-- **`MIN_RESERVE = 0.000999 ether`** (updated) — applied **independently per mode pool**, not once globally.
-- `MIN_EFFECTIVE = -69069`, `MAX_EFFECTIVE = 69069` — anti-hoarding gate, unchanged.
-- `CREDIT_STEP = 100`, `PUSH_WEIGHT = 1`, `TRUST_WEIGHT = 1` — credit-earning, unchanged.
-- `GAS_PER_CALLDATA_BYTE = 16`, `BASE_GAS_OVERHEAD = 23,500` (placeholder, needs calibration) — gas reimbursement, unchanged.
+1. **Directed bonds** — transferable bearer claims on a fixed ETH amount, always redeemable back to their original donor.
+2. **Common pool credits** — a donation pool, drawn down only by earning and spending credits from ledger activity.
 
-### Modes
-- A mode is a pair: **`(unit, records)`**.
-  - `unit` — ETH locked at mint / paid at redemption for this mode.
-  - `records` — a comparative percentage-vs-baseline label only; no computational role in redemption.
-- **Mode 0 (baseline)**: `unit = 0.000369 ETH`, `records = 100` (= 100% reference), created in the constructor.
-- **Creating a mode**: `createMode(unit, records)` — permissionless, callable by anyone, anytime.
-  - `unit >= UNIT` (`>= 0.000369 ether`).
-  - `records >= 100`.
-  - No upper bound on either.
-  - Immutable once created — no edit, no removal.
-  - Each mode gets a unique, incrementing `modeId` and its **own isolated pool**, starting at zero.
-- **Every mode, regardless of `records`, always costs exactly 1 credit to redeem.**
+dSOS does not issue a transferable ERC-20/721 token — `name()`/`symbol()` exist purely for wallet display.
 
-### Per-mode pool separation
-- `mapping(uint256 => uint256) public modeCommonPool` — each mode's own ETH balance, fully isolated from every other mode.
-- **Common-bond donations under mode X** credit only `modeCommonPool[X]`.
-- **Common-bond redemptions and `redeemCredit(modeId, ...)` under mode X** draw only from `modeCommonPool[X]` — never another mode's pool, never a blended total.
-- **`MIN_RESERVE = 0.000999 ETH` applies independently per mode**: `modeHeadroom(modeId) = max(modeCommonPool[modeId] − MIN_RESERVE, 0)`. Every mode maintains its own floor; a thin mode cannot borrow headroom from a flush one.
-- **Plain `receive()` ETH always and only credits `modeCommonPool[0]`** (baseline). There is no way to plain-send ETH into any other mode's pool — the only way to fund a non-baseline mode's pool is via `donateCommon`/`donateCommonBatch` under that specific `modeId`, which always mints a bond as part of the transaction.
+## Core constants
 
-### Directed bonds — unaffected by pool separation, except gas source
-- Directed-bond **principal** remains ring-fenced in the single global `totalEarmarked`, always paid in full, completely independent of any mode pool's balance.
-- Directed-bond **gas reimbursement** draws from **the same mode's pool the bond was minted under** — `modeCommonPool[bond.modeId]`, capped at that mode's own headroom (option b, confirmed).
+| Constant | Value | Purpose |
+|---|---|---|
+| `SOS69069_LEDGER` | `0x7373DBC24Dcd785896E8Ac3d5372c6ced9B75a8A` | External ledger this deployment reads/writes |
+| `UNIT` | `0.000369 ether` | Flat payout per credit redemption |
+| `MIN_RESERVE` | `0.000999 ether` | Floor the common pool must stay above after any credit redemption |
+| `MIN_EFFECTIVE` / `MAX_EFFECTIVE` | `-69069` / `+69069` | Eligibility window on `effectiveOf()`, required for **both** redemption paths |
+| `MIN_ACTIVITY` | `1000` | Minimum lifetime `pushCount + trustCount` required to redeem a credit |
 
-### Bonds
+SOS69069 itself has no transferable asset and rejects ETH outright — it only records signed messages and exposes live `Push`, `Trust`, and `effectiveOf() = Trust − Push` counters.
+
+## Directed bonds
+
 ```solidity
 struct Bond {
-    address holder;
-    bool active;
-    bool earmarked;
-    bytes32 creationRecordHash;
-    uint256 modeId;
-    uint256 principal; // = modes[modeId].unit at mint time
+    address donor;              // original funder — permanent, never changes
+    address holder;             // current holder — transferable
+    uint256 principal;          // ETH locked, any amount
+    bool    active;             // false once redeemed
+    bytes32 creationRecordHash; // exact SOS69069 struct hash of the mint record
 }
 ```
 
-### Minting
-- `donateCommon(modeId, mintTo, payloadHash, signature, metadata)` — 1 common bond; `msg.value == modes[modeId].unit`; credits `modeCommonPool[modeId]`.
-- `donateCommonBatch(modeId, mintTo, count, payloadHashes[], signatures[], metadatas[])` — `count` common bonds, one recipient; `msg.value == modes[modeId].unit * count`; all credited to `modeCommonPool[modeId]`.
-- `donateDirected(modeId, mintTo, payloadHash, signature, metadata)` — 1 directed bond; `msg.value == modes[modeId].unit`; added to global `totalEarmarked`.
-- `donateDirectedBatch(modeId, mintTo, count, payloadHashes[], signatures[], metadatas[])` — same pattern, batched.
-- All four require a valid donor signature; not gas-sponsored.
+**Creating a bond — `donateDirected(to, payloadHash, signature, metadata)`**
+- Donor sends **any ETH amount** (no fixed unit, no minimum beyond nonzero) in a single call.
+- Writes one signed record: `donor → to`.
+- One bond is created for the full amount — you do not need multiple bonds to reach a larger total.
+- `totalEarmarked` increases by the sent amount, ring-fencing it from the common pool.
 
-### Credit-earning — unchanged, mode-agnostic
-- `syncCredits(user)`: weighted push/trust deltas since last sync, `CREDIT_STEP = 100`, `PUSH_WEIGHT`/`TRUST_WEIGHT = 1`, remainder carried forward, no-op if no change.
-- One shared `redemptionCredits[user]` balance, spendable against any mode or bond type.
-- Callable by anyone, anytime.
+**Transferring — `transferBond(bondId, to, payloadHash, signature, metadata)`**
+- Only the current holder may call.
+- Writes a signed record: `currentHolder → to`.
+- `holder` updates; `donor` and `principal` never change; the bond stays active.
+- Can be repeated any number of times — a bond may pass through many hands before redemption.
 
-### Redemption
-**1. `relay(bondId, to, payloadHash, signature, metadata)`**
-- Mode read from `bonds[bondId].modeId`.
-- Redemption requires: `syncCredits(caller)`, `redemptionCredits[caller] >= 1`, `effectiveOf(caller)` within `[-69069, +69069]`.
-- Directed bond: principal in full from `totalEarmarked`; gas from `modeCommonPool[bond.modeId]` headroom.
-- Common bond: principal + gas both from `modeCommonPool[bond.modeId]`, scaled proportionally if thin; reverts if `principalPaid < bond.principal / 2`.
-- Forward (no redemption): bond changes holder, no credit/eligibility check.
+**Redeeming — `redeemDirected(bondId, payloadHash, signature, metadata)`**
 
-**2. `redeemCredit(modeId, payloadHash, signature, metadata)`**
-- No bond; caller picks `modeId` explicitly.
-- Same credit/eligibility checks.
-- Pays `modes[modeId].unit` (+ gas) from `modeCommonPool[modeId]` exclusively, scaled if thin; reverts if `principalPaid < modes[modeId].unit / 2`.
+- Only the current holder may call.
+- Requires `effectiveOf(holder)` within `[-69069, +69069]`.
+- Writes a signed record targeting the bond's **original donor** — regardless of how many transfers happened in between.
+- Pays the **current holder** the full `principal`, in full, always — never scaled down, never capped by pool health, since it's paid from the bond's own ring-fenced ETH.
+- `totalEarmarked` decreases by `principal`; the bond is marked inactive permanently.
 
-### Pool accounting
+**Example flow**: A creates a bond with 1 ETH to B (record: A→B). B transfers to C (record: B→C). C transfers to D (record: C→D). D redeems (record: D→A). D receives the full 1 ETH.
+
+## Common pool — donation only, no individual claims
+
+- `donateCommon(payloadHash, signature, metadata)`: donor sends any ETH amount, writes a record `donor → SOS69069_LEDGER`, and the ETH joins the shared pool. **No bond is minted** — this is a non-redeemable donation, not a claim.
+- Plain ETH sent via `receive()` also joins the pool, with no record and no bond.
+- `commonPool()` = contract balance minus `totalEarmarked` — the pool never includes ETH backing an active directed bond.
+
+## Credits — one push or trust, one credit
+
+```text
+syncCredits(user):
+  currentPush  = pushCountOf(user)
+  currentTrust = trustCountOf(user)
+  pushDelta    = max(currentPush  - lastPush[user],  0)
+  trustDelta   = max(currentTrust - lastTrust[user], 0)
+  if both are 0: no-op, no event
+
+  redemptionCredits[user] += pushDelta + trustDelta
+  lastPush[user]  = currentPush
+  lastTrust[user] = currentTrust
 ```
-contract balance = totalEarmarked                          (directed bonds, all modes, ring-fenced)
-                  + Σ modeCommonPool[i] for every mode i    (each mode's own isolated pool)
+
+No weighting, no conversion ratio, no remainder — **every single new push or trust record earns exactly 1 credit.** Callable by anyone, on any address, at any time. `pendingCredits(user)` previews the result without writing state.
+
+## Redeeming a credit — `redeemCredit(payloadHash, signature, metadata)`
+
+All four conditions must hold, or the call reverts before any state changes:
+- `redemptionCredits[caller] >= 1` (after an internal sync)
+- `effectiveOf(caller)` within `[-69069, +69069]`
+- Lifetime `pushCountOf(caller) + trustCountOf(caller) >= 1000`
+- `commonPool() >= MIN_RESERVE + UNIT` — paying out must not drop the pool below its floor
+
+On success: 1 credit is burned, a signed record `caller → SOS69069_LEDGER` is written, and the caller is paid a flat `0.000369 ETH`. No gas reimbursement.
+
+## Atomicity — the core guarantee
+
+Every state-changing function follows the same pattern: **local state is fully updated first, then the external ledger call happens, then (for redemptions) ETH is sent.** If `SOS.recordSignature(...)` reverts for any reason — invalid signature, duplicate record, wrong signer — the entire transaction reverts, undoing every state change made earlier in that same call. There is no path where a bond is marked redeemed, a credit is spent, or ETH leaves the contract without a corresponding successful signed record landing on the SOS69069 ledger in that same transaction.
+
+## Safety
+
+- `nonReentrant` guard on every state-changing function (`donateDirected`, `transferBond`, `redeemDirected`, `redeemCredit`).
+- All local state finalized *before* the external `recordSignature` call in every function — the ledger, being fixed and free of callbacks, can't reenter mid-update, but the ordering doesn't rely on that alone.
+- `totalEarmarked` is only ever incremented in `donateDirected` and decremented in `redeemDirected` — `transferBond` never touches it, since custody changes don't change how much ETH is locked.
+- `commonPool()` always excludes `totalEarmarked`, so directed-bond principal can never be reached through `redeemCredit`.
+- No owner, no admin functions, no upgradeability, no pause switch.
+
+## Views
+
+| Function | Returns |
+|---|---|
+| `commonPool()` | ETH available for credit redemption (balance minus earmarked) |
+| `poolBalance()` | Total contract ETH balance |
+| `isEligible(user)` | True iff `user` currently passes every `redeemCredit` gate |
+| `signerMetrics(user)` | Raw `push`, `trust`, `effective` values from the ledger |
+| `pendingCredits(user)` | Live credit balance as of a hypothetical sync now |
+| `bondCountOf(holder)` / `bondIdsOf(holder)` | Bonds currently held by an address |
+
+## Summary
+
+A donor locks any amount of ETH into a directed bond addressed to someone; that bond can change hands freely, but always settles back to the original donor's address on the ledger when finally redeemed, paying whoever holds it at that moment the full amount. Separately, anyone can top up a shared donation pool, and every signed push or trust record anyone earns on SOS69069 becomes a spendable credit — redeemable for a flat `0.000369 ETH`, as long as the holder's reputation sits within range, they've built up enough lifetime activity, and the pool can absorb the payout without dropping below its reserve.
 ```
-Each `modeCommonPool[i]` independently maintains its own `0.000999 ETH` reserve floor.
-
-### Chain ID
-- Not settable per-record; fixed permanently in the SOS69069 ledger's own EIP-712 domain separator at its deployment. dSOS forwards signatures as-is.
-
-### Known open items (carried forward, unresolved by earlier instruction)
-
-- First-sync retroactive credit (`lastPush`/`lastTrust` default to 0) — left as-is.
-- `PUSH_WEIGHT == TRUST_WEIGHT == 1` — confirmed intentional, immutable.
-
-### Invariants
-- No owner, no admin, no upgradeability, no pause switch.
-- Modes immutable once created, each with an isolated pool from inception.
-- Directed-bond principal always fully protected in the single global `totalEarmarked`.
-- Every common-pool redemption path (bond or standalone) draws only from its own specific mode's pool — never blended, never cross-subsidized.
-- Plain `receive()` ETH always and only funds mode 0's pool.
-- `MIN_RESERVE = 0.000999 ETH` enforced independently, per mode.
-- Redemption always requires both a spendable credit and an in-range `effectiveOf()` score.
-- Payment and ledger record remain atomic across every path.
