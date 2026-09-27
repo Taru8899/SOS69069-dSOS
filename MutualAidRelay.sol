@@ -20,9 +20,9 @@ interface ISOS69069 {
 ///      [MIN_EFFECTIVE, MAX_EFFECTIVE] as an independent anti-hoarding gate.
 ///      Directed-bond principal is ring-fenced in totalEarmarked and always
 ///      paid in full; MIN_RESERVE floors unearmarked funds against gas
-///      reimbursement across all redemption paths. Redemption reverts if
-///      pool headroom is too thin to pay any principal at all, rather than
-///      silently burning a credit for a zero payout.
+///      reimbursement across all redemption paths. Common-pool redemption
+///      reverts if the scaled-down principal would fall below
+///      MIN_PRINCIPAL_PAYOUT, preventing a credit being burned for dust.
 contract dSOS {
 
     // ============================================================ CONSTANTS
@@ -45,6 +45,11 @@ contract dSOS {
     uint256 public constant CREDIT_STEP = 100;
     uint256 public constant PUSH_WEIGHT = 1;
     uint256 public constant TRUST_WEIGHT = 1;
+
+    /// @notice Minimum acceptable principal payout from the common pool; a
+    ///         scaled-down payout below this reverts instead of burning a
+    ///         credit for dust. Set at half of UNIT.
+    uint256 public constant MIN_PRINCIPAL_PAYOUT = UNIT / 2;
 
     function name() external pure returns (string memory) { return "SOS69069 dSOS"; }
     function symbol() external pure returns (string memory) { return "dSOS"; }
@@ -79,8 +84,11 @@ contract dSOS {
 
     event DonatedCommon(address indexed donor, address indexed mintTo, uint256 startId, uint256 count, uint256 value);
     event DonatedDirected(address indexed donor, address indexed mintTo, uint256 startId, uint256 count, uint256 value);
-    event Relayed(uint256 indexed bondId, address indexed from, address indexed to, int256 signerEffective, bool redeemed);
-    event Redeemed(uint256 indexed bondId, address indexed holder, address indexed redeemTarget, bool earmarked, uint256 principalPaid, uint256 gasReimbursed, uint256 gasUsedMeasured);
+    /// @notice Emitted on every relay call, forward or redeem. Does not carry
+    ///         effectiveOf() — that value is only meaningful/measured during
+    ///         a redemption; see Redeemed for the redemption-time reading.
+    event Relayed(uint256 indexed bondId, address indexed from, address indexed to, bool redeemed);
+    event Redeemed(uint256 indexed bondId, address indexed holder, address indexed redeemTarget, bool earmarked, uint256 principalPaid, uint256 gasReimbursed, uint256 gasUsedMeasured, int256 signerEffective);
     event CreditRedeemed(address indexed user, int256 signerEffective, uint256 principalPaid, uint256 gasReimbursed, uint256 gasUsedMeasured);
     event Donation(address indexed from, uint256 amount);
     event CreditsSynced(address indexed user, uint256 creditsEarned, uint256 totalCredits, uint256 pushCount, uint256 trustCount);
@@ -189,7 +197,7 @@ contract dSOS {
 
     /// @notice Relays a bond to `to`; redeems if `to` is the redeem target, else forwards.
     /// @dev Redemption requires syncCredits(caller) > 0, effectiveOf(caller) in range,
-    ///      and non-zero pool headroom (reverts rather than burning a credit for nothing).
+    ///      and (for common bonds) a principal payout of at least MIN_PRINCIPAL_PAYOUT.
     function relay(uint256 bondId, address to, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external {
         uint256 gasStart = gasleft();
 
@@ -215,7 +223,7 @@ contract dSOS {
             _removeFromHolder(msg.sender, bondId);
             b.holder = to;
             _addToHolder(to, bondId);
-            emit Relayed(bondId, msg.sender, to, 0, false);
+            emit Relayed(bondId, msg.sender, to, false);
             return;
         }
 
@@ -236,11 +244,11 @@ contract dSOS {
             gasPaid = gasCost <= headroom ? gasCost : headroom;
         } else {
             (principalPaid, gasPaid) = _payFromCommonPool(UNIT, gasCost);
-            require(principalPaid > 0, "pool too thin");
+            require(principalPaid >= MIN_PRINCIPAL_PAYOUT, "pool too thin");
         }
 
-        emit Redeemed(bondId, payee, redeemTarget, wasEarmarked, principalPaid, gasPaid, gasUsedMeasured);
-        emit Relayed(bondId, payee, to, eff, true);
+        emit Redeemed(bondId, payee, redeemTarget, wasEarmarked, principalPaid, gasPaid, gasUsedMeasured, eff);
+        emit Relayed(bondId, payee, to, true);
 
         uint256 totalPayout = principalPaid + gasPaid;
         if (totalPayout > 0) {
@@ -250,8 +258,8 @@ contract dSOS {
     }
 
     /// @notice Redeems 1 credit directly for UNIT ETH from the common pool; no bond required.
-    /// @dev Requires redemptionCredits(caller) > 0, effectiveOf(caller) in range, and
-    ///      non-zero pool headroom (reverts rather than burning a credit for nothing).
+    /// @dev Requires redemptionCredits(caller) > 0, effectiveOf(caller) in range, and a
+    ///      principal payout of at least MIN_PRINCIPAL_PAYOUT.
     function redeemCredit(bytes32 payloadHash, bytes calldata signature, string calldata metadata) external {
         uint256 gasStart = gasleft();
 
@@ -265,7 +273,7 @@ contract dSOS {
 
         (uint256 gasUsedMeasured, uint256 gasCost) = _gasAccounting(gasStart);
         (uint256 principalPaid, uint256 gasPaid) = _payFromCommonPool(UNIT, gasCost);
-        require(principalPaid > 0, "pool too thin");
+        require(principalPaid >= MIN_PRINCIPAL_PAYOUT, "pool too thin");
 
         emit CreditRedeemed(msg.sender, eff, principalPaid, gasPaid, gasUsedMeasured);
 
