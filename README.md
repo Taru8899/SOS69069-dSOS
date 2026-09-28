@@ -23,66 +23,69 @@ SOS69069 itself has no transferable asset and rejects ETH outright — it only r
 
 ```solidity
 struct Bond {
-    address donor;              // original funder — permanent, never changes
     address holder;             // current holder — transferable
-    uint256 principal;          // ETH locked, any amount
+    uint96  principal;          // ETH locked (any amount up to uint96)
+    address donor;              // original funder — permanent, never changes
     bool    active;             // false once redeemed
-    bytes32 creationRecordHash; // exact SOS69069 struct hash of the mint record
+    uint64  index;              // position in bondsHeldBy[holder]
+    bytes32 recordHash;         // exact SOS69069 struct hash of the mint record
 }
 ```
 
 **Creating a bond — `donateDirected(to, payloadHash, signature, metadata)`**
-- Donor sends **any ETH amount** (no fixed unit, no minimum beyond nonzero) in a single call.
+- Donor sends **any ETH amount** (nonzero, ≤ `type(uint96).max`) in a single call.
 - Writes one signed record: `donor → to`.
-- One bond is created for the full amount — you do not need multiple bonds to reach a larger total.
+- One bond is created for the full amount.
+- `to` **may equal the donor** (self-bond is allowed).
 - `totalEarmarked` increases by the sent amount, ring-fencing it from the common pool.
 
 **Transferring — `transferBond(bondId, to, payloadHash, signature, metadata)`**
 - Only the current holder may call.
 - Writes a signed record: `currentHolder → to`.
 - `holder` updates; `donor` and `principal` never change; the bond stays active.
+- **A bond can never be transferred to its original donor** (`DonorCannotHold`).
 - Can be repeated any number of times — a bond may pass through many hands before redemption.
 
 **Redeeming — `redeemDirected(bondId, payloadHash, signature, metadata)`**
-
 - Only the current holder may call.
 - Requires `effectiveOf(holder)` within `[-69069, +69069]`.
-- Writes a signed record targeting the bond's **original donor** — regardless of how many transfers happened in between.
-- Pays the **current holder** the full `principal`, in full, always — never scaled down, never capped by pool health, since it's paid from the bond's own ring-fenced ETH.
+- Writes a signed record targeting the bond’s **original donor** — regardless of how many transfers happened in between.
+- Pays the **current holder** the full `principal`, in full, always — never scaled down, never capped by pool health (paid from the bond’s own ring-fenced ETH).
 - `totalEarmarked` decreases by `principal`; the bond is marked inactive permanently.
 
 **Example flow**: A creates a bond with 1 ETH to B (record: A→B). B transfers to C (record: B→C). C transfers to D (record: C→D). D redeems (record: D→A). D receives the full 1 ETH.
 
 ## Common pool — donation only, no individual claims
 
-- `donateCommon(payloadHash, signature, metadata)`: donor sends any ETH amount, writes a record `donor → SOS69069_LEDGER`, and the ETH joins the shared pool. **No bond is minted** — this is a non-redeemable donation, not a claim.
+- `donateCommon(payloadHash, signature, metadata)`: donor sends any ETH amount, writes a record `donor → SOS69069_LEDGER`, and the ETH joins the shared pool. **No bond is minted** — this is a non-redeemable donation.
 - Plain ETH sent via `receive()` also joins the pool, with no record and no bond.
 - `commonPool()` = contract balance minus `totalEarmarked` — the pool never includes ETH backing an active directed bond.
 
-## Credits — one push or trust, one credit
+## Credits — only trust increases earn credits
 
 ```text
-syncCredits(user):
-  currentPush  = pushCountOf(user)
-  currentTrust = trustCountOf(user)
-  pushDelta    = max(currentPush  - lastPush[user],  0)
-  trustDelta   = max(currentTrust - lastTrust[user], 0)
-  if both are 0: no-op, no event
-
-  redemptionCredits[user] += pushDelta + trustDelta
-  lastPush[user]  = currentPush
-  lastTrust[user] = currentTrust
+_sync(user):
+  (push, trust, eff) = SOS.statsOf(user)
+  if trust > lastTrust[user]:
+    earned = trust - lastTrust[user]
+    credits[user] += earned
+    lastTrust[user] = trust
+    emit CreditsSynced(...)
+  return push, trust, eff, credits[user]
 ```
 
-No weighting, no conversion ratio, no remainder — **every single new push or trust record earns exactly 1 credit.** Callable by anyone, on any address, at any time. `pendingCredits(user)` previews the result without writing state.
+- **Only increases in `trustCountOf()`** produce credits. Push records earn nothing.
+- This design ensures that a credit redemption’s own ledger record (which raises the caller’s Push) cannot itself mint a new credit.
+- No weighting, no conversion ratio, no remainder — every new trust record earns exactly 1 credit.
+- Callable by anyone, on any address, at any time via `syncCredits(user)`. `pendingCredits(user)` previews the result without writing state.
 
 ## Redeeming a credit — `redeemCredit(payloadHash, signature, metadata)`
 
 All four conditions must hold, or the call reverts before any state changes:
-- `redemptionCredits[caller] >= 1` (after an internal sync)
+- `redemptionCredits[caller] ≥ 1` (after an internal sync)
 - `effectiveOf(caller)` within `[-69069, +69069]`
-- Lifetime `pushCountOf(caller) + trustCountOf(caller) >= 1000`
-- `commonPool() >= MIN_RESERVE + UNIT` — paying out must not drop the pool below its floor
+- Lifetime `pushCountOf(caller) + trustCountOf(caller) ≥ 1000`
+- `commonPool() ≥ MIN_RESERVE + UNIT` — paying out must not drop the pool below its floor
 
 On success: 1 credit is burned, a signed record `caller → SOS69069_LEDGER` is written, and the caller is paid a flat `0.000369 ETH`. No gas reimbursement.
 
@@ -93,10 +96,12 @@ Every state-changing function follows the same pattern: **local state is fully u
 ## Safety
 
 - `nonReentrant` guard on every state-changing function (`donateDirected`, `transferBond`, `redeemDirected`, `redeemCredit`).
-- All local state finalized *before* the external `recordSignature` call in every function — the ledger, being fixed and free of callbacks, can't reenter mid-update, but the ordering doesn't rely on that alone.
-- `totalEarmarked` is only ever incremented in `donateDirected` and decremented in `redeemDirected` — `transferBond` never touches it, since custody changes don't change how much ETH is locked.
+- All local state finalized *before* the external `recordSignature` call in every function.
+- `totalEarmarked` is only ever incremented in `donateDirected` and decremented in `redeemDirected` — `transferBond` never touches it.
 - `commonPool()` always excludes `totalEarmarked`, so directed-bond principal can never be reached through `redeemCredit`.
 - No owner, no admin functions, no upgradeability, no pause switch.
+- Principal stored as `uint96`, counters as `uint128` for tight packing.
+- A bond can never be transferred to its original donor.
 
 ## Views
 
@@ -104,12 +109,14 @@ Every state-changing function follows the same pattern: **local state is fully u
 |---|---|
 | `commonPool()` | ETH available for credit redemption (balance minus earmarked) |
 | `poolBalance()` | Total contract ETH balance |
-| `isEligible(user)` | True iff `user` currently passes every `redeemCredit` gate |
+| `isEligible(user)` | True iff `user` currently passes every `redeemCredit` gate (except live pool balance) |
 | `signerMetrics(user)` | Raw `push`, `trust`, `effective` values from the ledger |
 | `pendingCredits(user)` | Live credit balance as of a hypothetical sync now |
 | `bondCountOf(holder)` / `bondIdsOf(holder)` | Bonds currently held by an address |
+| `bonds(bondId)` | Full bond details (donor, holder, principal, active, creationRecordHash) |
+| `lastTrust(user)` / `redemptionCredits(user)` | Raw account storage |
 
 ## Summary
 
-A donor locks any amount of ETH into a directed bond addressed to someone; that bond can change hands freely, but always settles back to the original donor's address on the ledger when finally redeemed, paying whoever holds it at that moment the full amount. Separately, anyone can top up a shared donation pool, and every signed push or trust record anyone earns on SOS69069 becomes a spendable credit — redeemable for a flat `0.000369 ETH`, as long as the holder's reputation sits within range, they've built up enough lifetime activity, and the pool can absorb the payout without dropping below its reserve.
+A donor locks any amount of ETH into a directed bond addressed to someone (including themselves); that bond can change hands freely (but never back to the original donor), and always settles back to the original donor’s address on the ledger when finally redeemed, paying whoever holds it at that moment the full amount. Separately, anyone can top up a shared donation pool, and every new **trust** record anyone earns on SOS69069 becomes a spendable credit — redeemable for a flat `0.000369 ETH`, as long as the holder’s reputation sits within range, they’ve built up enough lifetime activity, and the pool can absorb the payout without dropping below its reserve.
 ```
