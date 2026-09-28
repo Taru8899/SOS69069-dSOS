@@ -19,6 +19,9 @@ interface ISOS69069 {
 ///         does the transaction. Local state is finalized before the ledger call.
 /// @dev Credits accrue only from increases in trustCountOf(); push earns nothing, so a
 ///      redemption's own record (which raises the caller's Push) cannot mint a credit.
+///      redeemDirected requires effectiveOf INSIDE [MIN_EFFECTIVE, MAX_EFFECTIVE];
+///      redeemCredit requires it OUTSIDE that band, so self-addressed records (which
+///      raise Push and Trust equally and leave effective unchanged) cannot qualify.
 ///      A donor may create a self-bond; a bond can never be transferred to its donor.
 ///      Principal is stored as uint96 and counters as uint128 to pack storage.
 contract dSOS {
@@ -30,6 +33,7 @@ contract dSOS {
 
     uint256 public constant UNIT = 0.000369 ether;
     uint256 public constant MIN_RESERVE = 0.000999 ether;
+    /// @notice Effective-score band: redeemDirected needs inside it, redeemCredit needs outside it.
     int256 public constant MIN_EFFECTIVE = -69069;
     int256 public constant MAX_EFFECTIVE = 69069;
     /// @notice Minimum lifetime push + trust required to redeem a credit.
@@ -47,6 +51,7 @@ contract dSOS {
     error DonorCannotHold();
     error NoCredit();
     error EffectiveOutOfRange();
+    error EffectiveInBand();
     error InsufficientActivity();
     error PoolTooThin();
     error TransferFailed();
@@ -147,7 +152,7 @@ contract dSOS {
         emit BondTransferred(bondId, msg.sender, to);
     }
 
-    /// @notice Redeems a bond; current holder only, with effectiveOf(holder) in range.
+    /// @notice Redeems a bond; current holder only, with effectiveOf(holder) INSIDE the band.
     ///         The record targets the original donor; the holder receives the full principal.
     function redeemDirected(uint256 bondId, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external nonReentrant {
         Bond storage b = _bonds[bondId];
@@ -179,12 +184,12 @@ contract dSOS {
     }
 
     /// @notice Redeems 1 credit for a flat UNIT from the common pool.
-    /// @dev Needs >=1 credit, effectiveOf in range, push + trust >= MIN_ACTIVITY, and the
-    ///      pool must remain >= MIN_RESERVE after payout. No gas reimbursement.
+    /// @dev Needs >=1 credit, effectiveOf OUTSIDE the band, push + trust >= MIN_ACTIVITY, and
+    ///      the pool must remain >= MIN_RESERVE after payout. No gas reimbursement.
     function redeemCredit(bytes32 payloadHash, bytes calldata signature, string calldata metadata) external nonReentrant {
         (uint256 push, uint256 trust, int256 eff, uint256 credits) = _sync(msg.sender);
         if (credits == 0) revert NoCredit();
-        if (eff < MIN_EFFECTIVE || eff > MAX_EFFECTIVE) revert EffectiveOutOfRange();
+        if (eff >= MIN_EFFECTIVE && eff <= MAX_EFFECTIVE) revert EffectiveInBand();
         if (push + trust < MIN_ACTIVITY) revert InsufficientActivity();
         if (address(this).balance < totalEarmarked + MIN_RESERVE + UNIT) revert PoolTooThin();
 
@@ -225,7 +230,7 @@ contract dSOS {
     /// @notice True iff `user` passes every redeemCredit gate except pool balance.
     function isEligible(address user) external view returns (bool) {
         (uint256 push, uint256 trust, int256 eff) = SOS.statsOf(user);
-        if (eff < MIN_EFFECTIVE || eff > MAX_EFFECTIVE || push + trust < MIN_ACTIVITY) return false;
+        if ((eff >= MIN_EFFECTIVE && eff <= MAX_EFFECTIVE) || push + trust < MIN_ACTIVITY) return false;
         Account memory a = _acct[user];
         return a.credits + (trust > a.lastTrust ? trust - a.lastTrust : 0) > 0;
     }
