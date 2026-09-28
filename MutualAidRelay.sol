@@ -19,6 +19,9 @@ interface ISOS69069 {
 ///         SOS69069 record; if the record call reverts, the whole
 ///         transaction reverts. All local state is finalized before any
 ///         external ledger call.
+/// @dev Credits accrue only from increases in trustCountOf(). Push activity
+///      earns nothing, so a redemption's own ledger record (which raises the
+///      caller's Push, not Trust) can never mint a replacement credit.
 contract dSOS {
 
     // ============================================================ CONSTANTS
@@ -32,6 +35,7 @@ contract dSOS {
     int256 public constant MIN_EFFECTIVE = -69069;
     int256 public constant MAX_EFFECTIVE = 69069;
 
+    /// @notice Minimum lifetime pushCount + trustCount required to redeem a credit.
     uint256 public constant MIN_ACTIVITY = 1000;
 
     function name() external pure returns (string memory) { return "SOS69069 dSOS"; }
@@ -67,7 +71,7 @@ contract dSOS {
     mapping(address => uint256[]) public bondsHeldBy;
     mapping(uint256 => uint256) private _holderIndex;
 
-    mapping(address => uint256) public lastPush;
+    /// @notice Last observed trustCountOf() value per user; credits accrue from increases only.
     mapping(address => uint256) public lastTrust;
     mapping(address => uint256) public redemptionCredits;
 
@@ -171,19 +175,19 @@ contract dSOS {
 
     // ================================================================ CREDITS
 
+    /// @notice Adds 1 credit per new trust record since the last sync. Push
+    ///         activity earns nothing. Returns the current push and trust counts.
+    /// @dev No-op if trustCountOf() has not increased. Callable by anyone, anytime.
     function syncCredits(address user) public returns (uint256 currentPush, uint256 currentTrust) {
         currentPush = SOS.pushCountOf(user);
         currentTrust = SOS.trustCountOf(user);
-        uint256 pushDelta = currentPush > lastPush[user] ? currentPush - lastPush[user] : 0;
         uint256 trustDelta = currentTrust > lastTrust[user] ? currentTrust - lastTrust[user] : 0;
-        if (pushDelta == 0 && trustDelta == 0) return (currentPush, currentTrust);
+        if (trustDelta == 0) return (currentPush, currentTrust);
 
-        lastPush[user] = currentPush;
         lastTrust[user] = currentTrust;
-        uint256 earned = pushDelta + trustDelta;
-        redemptionCredits[user] += earned;
+        redemptionCredits[user] += trustDelta;
 
-        emit CreditsSynced(user, earned, redemptionCredits[user], currentPush, currentTrust);
+        emit CreditsSynced(user, trustDelta, redemptionCredits[user], currentPush, currentTrust);
     }
 
     /// @notice Redeems 1 credit for a flat UNIT ETH from the common pool.
@@ -232,12 +236,11 @@ contract dSOS {
         effective = SOS.effectiveOf(user);
     }
 
+    /// @notice Live credit balance as of a hypothetical syncCredits call now.
     function pendingCredits(address user) public view returns (uint256) {
-        uint256 currentPush = SOS.pushCountOf(user);
         uint256 currentTrust = SOS.trustCountOf(user);
-        uint256 pushDelta = currentPush > lastPush[user] ? currentPush - lastPush[user] : 0;
         uint256 trustDelta = currentTrust > lastTrust[user] ? currentTrust - lastTrust[user] : 0;
-        return redemptionCredits[user] + pushDelta + trustDelta;
+        return redemptionCredits[user] + trustDelta;
     }
 
     function bondCountOf(address holder) external view returns (uint256) { return bondsHeldBy[holder].length; }
