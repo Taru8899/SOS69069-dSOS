@@ -11,9 +11,11 @@ interface ISOS69069 {
 }
 
 /// @title SOS69069 dSOS
-/// @notice Ownerless. Three offer types (B/T/P) + credit pool with sawtooth rate.
-///         B = exact-seller (non-cancellable). T = public Trust buy. P = Push service.
-///         Credits from trust only. Gas refunds capped by value-at-stake and MIN_RESERVE.
+/// @notice Ownerless. Three offer types (B/T/P), all non-cancellable once created,
+///         transferable, and redeemable in full by whoever currently holds them.
+///         Plus a credit pool with sawtooth rate. Credits from trust only.
+///         No gas reimbursement anywhere: the common pool can only grow via
+///         receive()/donateCommon and can only shrink via redeemCredit payouts.
 contract dSOS {
     // ───────────────────────────────────────────── Constants
     address public constant SOS69069_LEDGER = 0x7373DBC24Dcd785896E8Ac3d5372c6ced9B75a8A;
@@ -26,16 +28,12 @@ contract dSOS {
     uint256 public constant BASE_RATE_PCT     = 30;
     uint256 public constant CYCLE_STEPS       = 71;
     uint256 public constant DEAD_ZONE_POS     = 70;
-    uint256 public constant CANCEL_BLOCKS     = 50_400; // ≈ 7 days
 
     // ───────────────────────────────────────────── Errors
     error ZeroAddress();
     error InvalidValue();
     error OfferNotActive();
     error NotHolder();
-    error NotDonor();
-    error TooEarlyToCancel();
-    error CannotCancelB();
     error NoCredit();
     error PoolTooThin();
     error TransferFailed();
@@ -50,7 +48,6 @@ contract dSOS {
         address donor;
         bool    active;
         uint64  index;
-        uint64  createdBlock;
         OfferType kind;
         bytes32 recordHash;
     }
@@ -69,15 +66,13 @@ contract dSOS {
     uint128 public totalEarmarked;
 
     // ───────────────────────────────────────────── Events
-    event OfferCreated(uint256 indexed id, OfferType kind, address indexed donor, address indexed to, uint256 principal, uint256 cancelBlock);
+    event OfferCreated(uint256 indexed id, OfferType kind, address indexed donor, address indexed to, uint256 principal);
     event OfferTransferred(uint256 indexed id, address indexed from, address indexed to);
     event OfferRedeemed(uint256 indexed id, address indexed donor, address indexed holder, uint256 principal);
-    event OfferCancelled(uint256 indexed id, address indexed donor, uint256 principal);
     event CommonDonation(address indexed donor, uint256 amount);
     event Donation(address indexed from, uint256 amount);
     event CreditsSynced(address indexed user, uint256 earned, uint256 total, uint256 push, uint256 trust);
     event CreditRedeemed(address indexed user, int256 eff, uint256 ratePct, uint256 paid);
-    event GasRefunded(address indexed to, uint256 gasUsed, uint256 amount);
 
     // ───────────────────────────────────────────── Modifiers
     modifier nonReentrant() {
@@ -93,11 +88,9 @@ contract dSOS {
     }
 
     function donateCommon(bytes32 payloadHash, bytes calldata signature, string calldata metadata) external payable nonReentrant {
-        uint256 g = gasleft();
         if (msg.value == 0) revert InvalidValue();
         SOS.recordSignature(msg.sender, SOS69069_LEDGER, payloadHash, signature, metadata);
         emit CommonDonation(msg.sender, msg.value);
-        _refund(msg.sender, g, msg.value);
     }
 
     // ───────────────────────────────────────────── Offers
@@ -108,7 +101,6 @@ contract dSOS {
         bytes calldata signature,
         string calldata metadata
     ) external payable nonReentrant {
-        uint256 g = gasleft();
         if (to == address(0)) revert ZeroAddress();
         if (msg.value == 0 || msg.value > type(uint96).max) revert InvalidValue();
 
@@ -121,15 +113,13 @@ contract dSOS {
             donor: msg.sender,
             active: true,
             index: _push(to, id),
-            createdBlock: uint64(block.number),
             kind: kind,
             recordHash: rh
         });
         totalEarmarked += uint128(msg.value);
 
         SOS.recordSignature(msg.sender, to, payloadHash, signature, metadata);
-        emit OfferCreated(id, kind, msg.sender, to, msg.value, block.number + CANCEL_BLOCKS);
-        _refund(msg.sender, g, msg.value);
+        emit OfferCreated(id, kind, msg.sender, to, msg.value);
     }
 
     function transferOffer(uint256 id, address to, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external nonReentrant {
@@ -144,11 +134,9 @@ contract dSOS {
 
         SOS.recordSignature(msg.sender, to, payloadHash, signature, metadata);
         emit OfferTransferred(id, msg.sender, to);
-        // no refund – no value at stake
     }
 
     function redeemOffer(uint256 id, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external nonReentrant {
-        uint256 g = gasleft();
         Offer storage o = _offers[id];
         if (!o.active) revert OfferNotActive();
         if (o.holder != msg.sender) revert NotHolder();
@@ -163,43 +151,14 @@ contract dSOS {
         SOS.recordSignature(msg.sender, donor, payloadHash, signature, metadata);
         emit OfferRedeemed(id, donor, msg.sender, principal);
         _send(msg.sender, principal);
-        _refund(msg.sender, g, principal);
-    }
-
-    function cancelOffer(
-        uint256 id,
-        bytes32 payloadHash,
-        bytes calldata signature,
-        string calldata metadata
-    ) external nonReentrant {
-        uint256 g = gasleft();
-        Offer storage o = _offers[id];
-        if (!o.active) revert OfferNotActive();
-        if (o.donor != msg.sender) revert NotDonor();
-        if (o.kind == OfferType.B) revert CannotCancelB();
-        if (block.number < uint256(o.createdBlock) + CANCEL_BLOCKS) revert TooEarlyToCancel();
-
-        uint96 principal = o.principal;
-        address holder = o.holder;
-
-        o.active = false;
-        totalEarmarked -= principal;
-        _pop(holder, o.index);
-
-        SOS.recordSignature(msg.sender, holder, payloadHash, signature, metadata);
-        emit OfferCancelled(id, msg.sender, principal);
-        _send(msg.sender, principal);
-        _refund(msg.sender, g, principal);
     }
 
     // ───────────────────────────────────────────── Credits
     function syncCredits(address user) external returns (uint256 push, uint256 trust) {
         (push, trust, , ) = _sync(user);
-        // no refund – no value at stake
     }
 
     function redeemCredit(bytes32 payloadHash, bytes calldata signature, string calldata metadata) external nonReentrant {
-        uint256 g = gasleft();
         (, , int256 eff, uint256 credits) = _sync(msg.sender);
         if (credits == 0) revert NoCredit();
 
@@ -213,16 +172,15 @@ contract dSOS {
         emit CreditRedeemed(msg.sender, eff, ratePct, payout);
 
         if (payout > 0) _send(msg.sender, payout);
-        _refund(msg.sender, g, payout);
     }
 
     // ───────────────────────────────────────────── Views
     function offers(uint256 id) external view returns (
         address donor, address holder, uint256 principal, bool active,
-        uint256 createdBlock, OfferType kind, bytes32 recordHash
+        OfferType kind, bytes32 recordHash
     ) {
         Offer storage o = _offers[id];
-        return (o.donor, o.holder, o.principal, o.active, o.createdBlock, o.kind, o.recordHash);
+        return (o.donor, o.holder, o.principal, o.active, o.kind, o.recordHash);
     }
 
     function lastTrust(address user) external view returns (uint256) { return _acct[user].lastTrust; }
@@ -309,21 +267,5 @@ contract dSOS {
     function _send(address to, uint256 amount) private {
         (bool ok, ) = to.call{value: amount}("");
         if (!ok) revert TransferFailed();
-    }
-
-    /// @dev Refund measured gas, capped by value-at-stake and never below MIN_RESERVE.
-    function _refund(address to, uint256 gasStart, uint256 cap) private {
-        uint256 used   = gasStart - gasleft();
-        uint256 refund = used * tx.gasprice;
-        if (refund > cap) refund = cap;
-
-        uint256 pool = commonPool();
-        if (refund + MIN_RESERVE > pool)
-            refund = pool > MIN_RESERVE ? pool - MIN_RESERVE : 0;
-
-        if (refund > 0) {
-            _send(to, refund);
-            emit GasRefunded(to, used, refund);
-        }
     }
 }
