@@ -13,21 +13,20 @@ interface ISOS69069 {
 /// @title SOS69069 dSOS
 /// @notice Ownerless. Three offer types (B/T/P) + credit pool with sawtooth rate.
 ///         B = exact-seller (non-cancellable). T = public Trust buy. P = Push service.
-///         Credits from trust only. All state-changing calls refund measured gas from common pool
-///         without touching MIN_RESERVE.
+///         Credits from trust only. Gas refunds capped by value-at-stake and MIN_RESERVE.
 contract dSOS {
     // ───────────────────────────────────────────── Constants
     address public constant SOS69069_LEDGER = 0x7373DBC24Dcd785896E8Ac3d5372c6ced9B75a8A;
     ISOS69069 public constant SOS = ISOS69069(SOS69069_LEDGER);
 
-    uint256 public constant UNIT            = 0.006 ether;
-    uint256 public constant MIN_RESERVE     = 0.000999 ether;
-    uint256 public constant RATE_STEP       = 1001;
-    uint256 public constant BASE_RATE_PCT   = 30;
-    uint256 public constant CYCLE_STEPS     = 71;
-    uint256 public constant DEAD_ZONE_POS   = 70;
-    uint256 public constant CANCEL_BLOCKS   = 50_400;   // ≈ 7 days
-    uint256 public constant GAS_OVERHEAD    = 25_000;
+    uint256 public constant UNIT              = 0.006 ether;
+    uint256 public constant MIN_RESERVE       = 0.000999 ether;
+    uint256 public constant DEAD_ZONE_PAYOUT  = 0.0000033 ether; // ≈ $0.01
+    uint256 public constant RATE_STEP         = 1001;
+    uint256 public constant BASE_RATE_PCT     = 30;
+    uint256 public constant CYCLE_STEPS       = 71;
+    uint256 public constant DEAD_ZONE_POS     = 70;
+    uint256 public constant CANCEL_BLOCKS     = 50_400; // ≈ 7 days
 
     // ───────────────────────────────────────────── Errors
     error ZeroAddress();
@@ -45,9 +44,6 @@ contract dSOS {
     // ───────────────────────────────────────────── Storage
     enum OfferType { B, T, P }
 
-    // slot0: holder (160) + principal (96)
-    // slot1: donor (160) + active (8) + index (64) + createdBlock (64) + kind (8) → fits in 160+8+64+64+8 = 304 bits → 2 slots
-    // slot2: recordHash
     struct Offer {
         address holder;
         uint96  principal;
@@ -60,8 +56,8 @@ contract dSOS {
     }
 
     struct Account {
-        uint128 lastTrust;
-        uint128 credits;
+        uint256 lastTrust;
+        uint256 credits;
     }
 
     mapping(uint256 => Offer) private _offers;
@@ -101,7 +97,7 @@ contract dSOS {
         if (msg.value == 0) revert InvalidValue();
         SOS.recordSignature(msg.sender, SOS69069_LEDGER, payloadHash, signature, metadata);
         emit CommonDonation(msg.sender, msg.value);
-        _refund(msg.sender, g);
+        _refund(msg.sender, g, msg.value);
     }
 
     // ───────────────────────────────────────────── Offers
@@ -133,11 +129,10 @@ contract dSOS {
 
         SOS.recordSignature(msg.sender, to, payloadHash, signature, metadata);
         emit OfferCreated(id, kind, msg.sender, to, msg.value, block.number + CANCEL_BLOCKS);
-        _refund(msg.sender, g);
+        _refund(msg.sender, g, msg.value);
     }
 
     function transferOffer(uint256 id, address to, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external nonReentrant {
-        uint256 g = gasleft();
         Offer storage o = _offers[id];
         if (!o.active) revert OfferNotActive();
         if (o.holder != msg.sender) revert NotHolder();
@@ -149,7 +144,7 @@ contract dSOS {
 
         SOS.recordSignature(msg.sender, to, payloadHash, signature, metadata);
         emit OfferTransferred(id, msg.sender, to);
-        _refund(msg.sender, g);
+        // no refund – no value at stake
     }
 
     function redeemOffer(uint256 id, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external nonReentrant {
@@ -168,10 +163,15 @@ contract dSOS {
         SOS.recordSignature(msg.sender, donor, payloadHash, signature, metadata);
         emit OfferRedeemed(id, donor, msg.sender, principal);
         _send(msg.sender, principal);
-        _refund(msg.sender, g);
+        _refund(msg.sender, g, principal);
     }
 
-    function cancelOffer(uint256 id) external nonReentrant {
+    function cancelOffer(
+        uint256 id,
+        bytes32 payloadHash,
+        bytes calldata signature,
+        string calldata metadata
+    ) external nonReentrant {
         uint256 g = gasleft();
         Offer storage o = _offers[id];
         if (!o.active) revert OfferNotActive();
@@ -180,38 +180,40 @@ contract dSOS {
         if (block.number < uint256(o.createdBlock) + CANCEL_BLOCKS) revert TooEarlyToCancel();
 
         uint96 principal = o.principal;
+        address holder = o.holder;
+
         o.active = false;
         totalEarmarked -= principal;
-        _pop(o.holder, o.index);
+        _pop(holder, o.index);
 
+        SOS.recordSignature(msg.sender, holder, payloadHash, signature, metadata);
         emit OfferCancelled(id, msg.sender, principal);
         _send(msg.sender, principal);
-        _refund(msg.sender, g);
+        _refund(msg.sender, g, principal);
     }
 
     // ───────────────────────────────────────────── Credits
-    function syncCredits(address user) external nonReentrant returns (uint256 push, uint256 trust) {
-        uint256 g = gasleft();
+    function syncCredits(address user) external returns (uint256 push, uint256 trust) {
         (push, trust, , ) = _sync(user);
-        _refund(msg.sender, g);
+        // no refund – no value at stake
     }
 
     function redeemCredit(bytes32 payloadHash, bytes calldata signature, string calldata metadata) external nonReentrant {
         uint256 g = gasleft();
-        ( , , int256 eff, uint256 credits) = _sync(msg.sender);
+        (, , int256 eff, uint256 credits) = _sync(msg.sender);
         if (credits == 0) revert NoCredit();
 
-        uint256 ratePct = _ratePercent(eff);
-        uint256 payout  = UNIT * ratePct / 100;
-
+        uint256 payout = _payoutFor(eff);
         if (address(this).balance < totalEarmarked + MIN_RESERVE + payout) revert PoolTooThin();
 
-        _acct[msg.sender].credits = uint128(credits - 1);
+        _acct[msg.sender].credits = credits - 1;
         SOS.recordSignature(msg.sender, SOS69069_LEDGER, payloadHash, signature, metadata);
+
+        uint256 ratePct = payout == DEAD_ZONE_PAYOUT ? 0 : (payout * 100) / UNIT;
         emit CreditRedeemed(msg.sender, eff, ratePct, payout);
 
         if (payout > 0) _send(msg.sender, payout);
-        _refund(msg.sender, g);
+        _refund(msg.sender, g, payout);
     }
 
     // ───────────────────────────────────────────── Views
@@ -239,11 +241,16 @@ contract dSOS {
         return a.credits + (t > a.lastTrust ? t - a.lastTrust : 0);
     }
 
-    function ratePercentOf(int256 eff) external pure returns (uint256) { return _ratePercent(eff); }
+    function ratePercentOf(int256 eff) external pure returns (uint256) {
+        uint256 abs = eff >= 0 ? uint256(eff) : uint256(-(eff + 1)) + 1;
+        uint256 pos = (abs / RATE_STEP) % CYCLE_STEPS;
+        return pos == DEAD_ZONE_POS ? 0 : BASE_RATE_PCT + pos;
+    }
 
     function quoteRedeemCredit(address user) external view returns (uint256 ratePct, uint256 payout) {
-        ratePct = _ratePercent(SOS.effectiveOf(user));
-        payout  = UNIT * ratePct / 100;
+        int256 eff = SOS.effectiveOf(user);
+        payout = _payoutFor(eff);
+        ratePct = payout == DEAD_ZONE_PAYOUT ? 0 : (payout * 100) / UNIT;
     }
 
     function isEligible(address user) external view returns (bool) {
@@ -263,10 +270,11 @@ contract dSOS {
     function symbol() external pure returns (string memory) { return "dSOS"; }
 
     // ───────────────────────────────────────────── Internal
-    function _ratePercent(int256 eff) private pure returns (uint256) {
-        uint256 abs = eff >= 0 ? uint256(eff) : uint256(-eff);
+    function _payoutFor(int256 eff) private pure returns (uint256) {
+        uint256 abs = eff >= 0 ? uint256(eff) : uint256(-(eff + 1)) + 1;
         uint256 pos = (abs / RATE_STEP) % CYCLE_STEPS;
-        return pos == DEAD_ZONE_POS ? 0 : BASE_RATE_PCT + pos;
+        if (pos == DEAD_ZONE_POS) return DEAD_ZONE_PAYOUT;
+        return UNIT * (BASE_RATE_PCT + pos) / 100;
     }
 
     function _sync(address user) private returns (uint256 push, uint256 trust, int256 eff, uint256 credits) {
@@ -276,7 +284,7 @@ contract dSOS {
         if (trust > a.lastTrust) {
             uint256 earned = trust - a.lastTrust;
             credits += earned;
-            _acct[user] = Account(uint128(trust), uint128(credits));
+            _acct[user] = Account(trust, credits);
             emit CreditsSynced(user, earned, credits, push, trust);
         }
     }
@@ -288,6 +296,7 @@ contract dSOS {
 
     function _pop(address holder, uint256 idx) private {
         uint256[] storage arr = offersHeldBy[holder];
+        if (arr.length == 0 || idx >= arr.length) revert OfferNotActive();
         uint256 last = arr.length - 1;
         if (idx != last) {
             uint256 lastId = arr[last];
@@ -302,15 +311,16 @@ contract dSOS {
         if (!ok) revert TransferFailed();
     }
 
-    /// @dev Refund measured gas from common pool. Never dips below MIN_RESERVE.
-    function _refund(address to, uint256 gasStart) private {
-        uint256 used = gasStart - gasleft() + GAS_OVERHEAD;
+    /// @dev Refund measured gas, capped by value-at-stake and never below MIN_RESERVE.
+    function _refund(address to, uint256 gasStart, uint256 cap) private {
+        uint256 used   = gasStart - gasleft();
         uint256 refund = used * tx.gasprice;
-        uint256 pool = commonPool();
+        if (refund > cap) refund = cap;
 
-        if (refund + MIN_RESERVE > pool) {
+        uint256 pool = commonPool();
+        if (refund + MIN_RESERVE > pool)
             refund = pool > MIN_RESERVE ? pool - MIN_RESERVE : 0;
-        }
+
         if (refund > 0) {
             _send(to, refund);
             emit GasRefunded(to, used, refund);
