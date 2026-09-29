@@ -1,4 +1,4 @@
-**SOS69069 dSOS**
+## SOS69069 dSOS
 
 An ownerless ETH contract with three parallel offer instruments (B / T / P) and a credit-based common pool, both gated by real signed records on the external **SOS69069** reputation ledger.
 
