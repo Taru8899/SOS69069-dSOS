@@ -19,7 +19,9 @@ interface ISOS69069 {
 ///         grows only via receive()/donateCommon and shrinks only via
 ///         redeemCredit/redeemGasClaim payouts.
 contract dSOS {
-    // ───────────────────────────────────────────── Constants
+
+    // ============================================================ CONSTANTS
+
     address public constant SOS69069_LEDGER = 0x7373DBC24Dcd785896E8Ac3d5372c6ced9B75a8A;
     ISOS69069 public constant SOS = ISOS69069(SOS69069_LEDGER);
 
@@ -32,7 +34,8 @@ contract dSOS {
     uint256 public constant DEAD_ZONE_POS     = 70;
     uint256 public constant GAS_CLAIM_MINT    = 1; // wei, fixed, per nonzero donation call
 
-    // ───────────────────────────────────────────── Errors
+    // ============================================================ ERRORS
+
     error ZeroAddress();
     error ZeroAmount();
     error InvalidValue();
@@ -46,7 +49,8 @@ contract dSOS {
     error TransferFailed();
     error Reentrant();
 
-    // ───────────────────────────────────────────── Storage
+    // ============================================================ STORAGE
+
     enum OfferType { B, T, P }
 
     struct Offer {
@@ -77,7 +81,8 @@ contract dSOS {
     mapping(address => mapping(address => uint256)) public allowance;
     uint256 public totalSupply;
 
-    // ───────────────────────────────────────────── Events
+    // ============================================================ EVENTS
+
     event OfferCreated(uint256 indexed id, OfferType kind, address indexed donor, address indexed to, uint256 principal);
     event OfferTransferred(uint256 indexed id, address indexed from, address indexed to);
     event OfferRedeemed(uint256 indexed id, address indexed donor, address indexed holder, uint256 principal);
@@ -90,7 +95,8 @@ contract dSOS {
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Approval(address indexed owner, address indexed spender, uint256 value);
 
-    // ───────────────────────────────────────────── Modifiers
+    // ============================================================ MODIFIERS
+
     modifier nonReentrant() {
         if (_locked) revert Reentrant();
         _locked = true;
@@ -98,9 +104,10 @@ contract dSOS {
         _locked = false;
     }
 
-    // ───────────────────────────────────────────── Funding
+    // ============================================================ FUNDING
+
     /// @notice Plain ETH top-up. Mints GasClaim only if value > 0. No ledger record.
-    receive() external payable {
+    receive() external payable nonReentrant {
         if (msg.value > 0) _mint(msg.sender, GAS_CLAIM_MINT);
         emit Donation(msg.sender, msg.value);
     }
@@ -113,7 +120,8 @@ contract dSOS {
         emit CommonDonation(msg.sender, msg.value);
     }
 
-    // ───────────────────────────────────────────── Offers
+    // ============================================================ OFFERS
+
     /// @notice Locks msg.value for `to`, atomic with a donor -> to record. Non-cancellable.
     function createOffer(
         OfferType kind,
@@ -176,7 +184,8 @@ contract dSOS {
         _send(msg.sender, principal);
     }
 
-    // ───────────────────────────────────────────── Credits
+    // ============================================================ CREDITS
+
     /// @notice Credits `user` 1 per new trust record since the last sync.
     function syncCredits(address user) external returns (uint256 push, uint256 trust) {
         (push, trust, , ) = _sync(user);
@@ -215,7 +224,8 @@ contract dSOS {
         emit CreditsTransferred(msg.sender, to, amount, effAtSend, trustAtSend);
     }
 
-    // ───────────────────────────────────────────── GasClaim (minimal ERC20)
+    // ============================================================ GASCLAIM (MINIMAL ERC20)
+
     function gasClaimName() external pure returns (string memory) { return "GasClaim"; }
     function gasClaimSymbol() external pure returns (string memory) { return "GASC"; }
     function decimals() external pure returns (uint8) { return 18; }
@@ -256,7 +266,8 @@ contract dSOS {
         _send(msg.sender, amount);
     }
 
-    // ───────────────────────────────────────────── Views
+    // ============================================================ VIEWS
+
     function offers(uint256 id) external view returns (
         address donor, address holder, uint256 principal, bool active,
         OfferType kind, bytes32 recordHash
@@ -309,7 +320,8 @@ contract dSOS {
     function name() external pure returns (string memory) { return "SOS69069 dSOS"; }
     function symbol() external pure returns (string memory) { return "dSOS"; }
 
-    // ───────────────────────────────────────────── Internal
+    // ============================================================ INTERNAL
+
     function _payoutFor(int256 eff) private pure returns (uint256) {
         uint256 abs = eff >= 0 ? uint256(eff) : uint256(-(eff + 1)) + 1;
         uint256 pos = (abs / RATE_STEP) % CYCLE_STEPS;
