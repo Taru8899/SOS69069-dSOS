@@ -4,6 +4,7 @@ pragma solidity 0.8.36;
 /// @title ISOS69069
 interface ISOS69069 {
     function recordSignature(address signer, address intendedTo, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external;
+    /// @dev MUST remain pure. Ledger must not write state inside this function.
     function recordStructHash(address signer, address intendedTo, bytes32 payloadHash, string calldata metadata) external pure returns (bytes32);
     function effectiveOf(address user) external view returns (int256);
     function trustCountOf(address user) external view returns (uint256);
@@ -20,7 +21,7 @@ interface ISOS69069 {
 ///         redeemCredit/redeemGasClaim payouts.
 contract dSOS {
 
-    // ============================================================ CONSTANTS
+    // CONSTANTS ============================================================
 
     address public constant SOS69069_LEDGER = 0x7373DBC24Dcd785896E8Ac3d5372c6ced9B75a8A;
     ISOS69069 public constant SOS = ISOS69069(SOS69069_LEDGER);
@@ -34,7 +35,7 @@ contract dSOS {
     uint256 public constant DEAD_ZONE_POS     = 70;
     uint256 public constant GAS_CLAIM_MINT    = 1; // wei, fixed, per nonzero donation call
 
-    // ============================================================ ERRORS
+    // ERRORS ===============================================================
 
     error ZeroAddress();
     error ZeroAmount();
@@ -48,8 +49,9 @@ contract dSOS {
     error PoolTooThin();
     error TransferFailed();
     error Reentrant();
+    error TooManyOffers();
 
-    // ============================================================ STORAGE
+    // STORAGE ==============================================================
 
     enum OfferType { B, T, P }
 
@@ -74,14 +76,14 @@ contract dSOS {
 
     uint64  public nextOfferId = 1;
     bool    private _locked;
-    uint128 public totalEarmarked;
+    uint256 public totalEarmarked;
 
     // GasClaim (minimal ERC20, embedded)
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
     uint256 public totalSupply;
 
-    // ============================================================ EVENTS
+    // EVENTS ===============================================================
 
     event OfferCreated(uint256 indexed id, OfferType kind, address indexed donor, address indexed to, uint256 principal);
     event OfferTransferred(uint256 indexed id, address indexed from, address indexed to);
@@ -95,7 +97,7 @@ contract dSOS {
     event Transfer(address indexed from, address indexed to, uint256 value);
     event Approval(address indexed owner, address indexed spender, uint256 value);
 
-    // ============================================================ MODIFIERS
+    // MODIFIERS ============================================================
 
     modifier nonReentrant() {
         if (_locked) revert Reentrant();
@@ -104,7 +106,7 @@ contract dSOS {
         _locked = false;
     }
 
-    // ============================================================ FUNDING
+    // FUNDING ==============================================================
 
     /// @notice Plain ETH top-up. Mints GasClaim only if value > 0. No ledger record.
     receive() external payable nonReentrant {
@@ -120,7 +122,7 @@ contract dSOS {
         emit CommonDonation(msg.sender, msg.value);
     }
 
-    // ============================================================ OFFERS
+    // OFFERS ===============================================================
 
     /// @notice Locks msg.value for `to`, atomic with a donor -> to record. Non-cancellable.
     function createOffer(
@@ -145,7 +147,7 @@ contract dSOS {
             kind: kind,
             recordHash: rh
         });
-        totalEarmarked += uint128(msg.value);
+        totalEarmarked += msg.value;
 
         SOS.recordSignature(msg.sender, to, payloadHash, signature, metadata);
         emit OfferCreated(id, kind, msg.sender, to, msg.value);
@@ -184,14 +186,14 @@ contract dSOS {
         _send(msg.sender, principal);
     }
 
-    // ============================================================ CREDITS
+    // CREDITS ==============================================================
 
-    /// @notice Credits `user` 1 per new trust record since the last sync.
+    /// @notice Credits `user` 1 per new trust record since the last sync. Permissionless.
     function syncCredits(address user) external returns (uint256 push, uint256 trust) {
         (push, trust, , ) = _sync(user);
     }
 
-    /// @notice Burns 1 credit; pays UNIT * sawtooth-rate(effectiveOf(caller)) / 100.
+    /// @notice Burns 1 credit; pays according to the sawtooth rate.
     function redeemCredit(bytes32 payloadHash, bytes calldata signature, string calldata metadata) external nonReentrant {
         (, , int256 eff, uint256 credits) = _sync(msg.sender);
         if (credits == 0) revert NoCredit();
@@ -199,7 +201,9 @@ contract dSOS {
         uint256 payout = _payoutFor(eff);
         if (address(this).balance < totalEarmarked + MIN_RESERVE + payout) revert PoolTooThin();
 
+        // Single write to credits slot
         _acct[msg.sender].credits = credits - 1;
+
         SOS.recordSignature(msg.sender, SOS69069_LEDGER, payloadHash, signature, metadata);
 
         uint256 ratePct = payout == DEAD_ZONE_PAYOUT ? 0 : (payout * 100) / UNIT;
@@ -208,29 +212,33 @@ contract dSOS {
         if (payout > 0) _send(msg.sender, payout);
     }
 
-    /// @notice Moves `amount` credits to `to`, a clean hop with no stored provenance.
+    /// @notice Moves `amount` credits to `to`. Auto-syncs sender first.
     function transferCredits(address to, uint256 amount, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external nonReentrant {
         if (to == address(0)) revert ZeroAddress();
         if (amount == 0) revert ZeroAmount();
-        if (_acct[msg.sender].credits < amount) revert InsufficientCredits();
+
+        // Option A: auto-sync sender so pending credits become transferable
+        (, , , uint256 credits) = _sync(msg.sender);
+        if (credits < amount) revert InsufficientCredits();
 
         int256 effAtSend = SOS.effectiveOf(msg.sender);
         uint256 trustAtSend = SOS.trustCountOf(msg.sender);
 
-        _acct[msg.sender].credits -= amount;
+        _acct[msg.sender].credits = credits - amount;
         _acct[to].credits += amount;
 
         SOS.recordSignature(msg.sender, to, payloadHash, signature, metadata);
         emit CreditsTransferred(msg.sender, to, amount, effAtSend, trustAtSend);
     }
 
-    // ============================================================ GASCLAIM (MINIMAL ERC20)
+    // GASCLAIM (MINIMAL ERC20) =============================================
 
     function gasClaimName() external pure returns (string memory) { return "GasClaim"; }
     function gasClaimSymbol() external pure returns (string memory) { return "GASC"; }
     function decimals() external pure returns (uint8) { return 18; }
 
     function transfer(address to, uint256 amount) external returns (bool) {
+        if (to == address(0)) revert ZeroAddress();
         if (balanceOf[msg.sender] < amount) revert InsufficientBalance();
         balanceOf[msg.sender] -= amount;
         balanceOf[to] += amount;
@@ -245,9 +253,15 @@ contract dSOS {
     }
 
     function transferFrom(address from, address to, uint256 amount) external returns (bool) {
-        if (allowance[from][msg.sender] < amount) revert InsufficientAllowance();
+        if (to == address(0)) revert ZeroAddress();
         if (balanceOf[from] < amount) revert InsufficientBalance();
-        allowance[from][msg.sender] -= amount;
+
+        uint256 allowed = allowance[from][msg.sender];
+        if (allowed != type(uint256).max) {
+            if (allowed < amount) revert InsufficientAllowance();
+            allowance[from][msg.sender] = allowed - amount;
+        }
+
         balanceOf[from] -= amount;
         balanceOf[to] += amount;
         emit Transfer(from, to, amount);
@@ -266,7 +280,7 @@ contract dSOS {
         _send(msg.sender, amount);
     }
 
-    // ============================================================ VIEWS
+    // VIEWS ================================================================
 
     function offers(uint256 id) external view returns (
         address donor, address holder, uint256 principal, bool active,
@@ -320,7 +334,7 @@ contract dSOS {
     function name() external pure returns (string memory) { return "SOS69069 dSOS"; }
     function symbol() external pure returns (string memory) { return "dSOS"; }
 
-    // ============================================================ INTERNAL
+    // INTERNAL =============================================================
 
     function _payoutFor(int256 eff) private pure returns (uint256) {
         uint256 abs = eff >= 0 ? uint256(eff) : uint256(-(eff + 1)) + 1;
@@ -329,20 +343,23 @@ contract dSOS {
         return UNIT * (BASE_RATE_PCT + pos) / 100;
     }
 
+    /// @dev Only updates lastTrust. Credits are written by the caller (single SSTORE).
     function _sync(address user) private returns (uint256 push, uint256 trust, int256 eff, uint256 credits) {
         (push, trust, eff) = SOS.statsOf(user);
-        Account memory a = _acct[user];
+        Account storage a = _acct[user];
         credits = a.credits;
         if (trust > a.lastTrust) {
             uint256 earned = trust - a.lastTrust;
             credits += earned;
-            _acct[user] = Account(trust, credits);
+            a.lastTrust = trust;               // only write lastTrust
             emit CreditsSynced(user, earned, credits, push, trust);
         }
     }
 
     function _push(address holder, uint256 id) private returns (uint64 idx) {
-        idx = uint64(offersHeldBy[holder].length);
+        uint256 len = offersHeldBy[holder].length;
+        if (len > type(uint64).max) revert TooManyOffers();
+        idx = uint64(len);
         offersHeldBy[holder].push(id);
     }
 
