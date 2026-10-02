@@ -13,9 +13,12 @@ interface ISOS69069 {
 /// @title SOS69069 dSOS
 /// @notice Ownerless. Three offer types (B/T/P), all non-cancellable once created,
 ///         transferable, and redeemable in full by whoever currently holds them.
-///         Plus a credit pool with sawtooth rate. Credits from trust only.
-///         No gas reimbursement anywhere: the common pool can only grow via
-///         receive()/donateCommon and can only shrink via redeemCredit payouts.
+///         Plus a credit pool with sawtooth rate. Credits from trust only, and
+///         transferable between accounts as clean, provenance-free hops.
+///         Plus GasClaim, a minimal ERC20 minting a fixed 1 wei to msg.sender on
+///         every receive()/donateCommon call, redeemable 1:1 for ETH.
+///         The common pool can only grow via receive()/donateCommon and can
+///         only shrink via redeemCredit and redeemGasClaim payouts.
 contract dSOS {
     // ───────────────────────────────────────────── Constants
     address public constant SOS69069_LEDGER = 0x7373DBC24Dcd785896E8Ac3d5372c6ced9B75a8A;
@@ -28,6 +31,7 @@ contract dSOS {
     uint256 public constant BASE_RATE_PCT     = 30;
     uint256 public constant CYCLE_STEPS       = 71;
     uint256 public constant DEAD_ZONE_POS     = 70;
+    uint256 public constant GAS_CLAIM_MINT    = 1; // wei, fixed, per receive()/donateCommon call
 
     // ───────────────────────────────────────────── Errors
     error ZeroAddress();
@@ -35,6 +39,9 @@ contract dSOS {
     error OfferNotActive();
     error NotHolder();
     error NoCredit();
+    error InsufficientCredits();
+    error InsufficientBalance();
+    error InsufficientAllowance();
     error PoolTooThin();
     error TransferFailed();
     error Reentrant();
@@ -65,6 +72,11 @@ contract dSOS {
     bool    private _locked;
     uint128 public totalEarmarked;
 
+    // GasClaim (minimal ERC20, embedded)
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    uint256 public totalSupply;
+
     // ───────────────────────────────────────────── Events
     event OfferCreated(uint256 indexed id, OfferType kind, address indexed donor, address indexed to, uint256 principal);
     event OfferTransferred(uint256 indexed id, address indexed from, address indexed to);
@@ -73,6 +85,10 @@ contract dSOS {
     event Donation(address indexed from, uint256 amount);
     event CreditsSynced(address indexed user, uint256 earned, uint256 total, uint256 push, uint256 trust);
     event CreditRedeemed(address indexed user, int256 eff, uint256 ratePct, uint256 paid);
+    event CreditsTransferred(address indexed from, address indexed to, uint256 amount, int256 effAtSend, uint256 trustAtSend);
+    event GasClaimRedeemed(address indexed user, uint256 amount);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
 
     // ───────────────────────────────────────────── Modifiers
     modifier nonReentrant() {
@@ -84,11 +100,13 @@ contract dSOS {
 
     // ───────────────────────────────────────────── Funding
     receive() external payable {
+        _mint(msg.sender, GAS_CLAIM_MINT);
         emit Donation(msg.sender, msg.value);
     }
 
     function donateCommon(bytes32 payloadHash, bytes calldata signature, string calldata metadata) external payable nonReentrant {
         if (msg.value == 0) revert InvalidValue();
+        _mint(msg.sender, GAS_CLAIM_MINT);
         SOS.recordSignature(msg.sender, SOS69069_LEDGER, payloadHash, signature, metadata);
         emit CommonDonation(msg.sender, msg.value);
     }
@@ -172,6 +190,64 @@ contract dSOS {
         emit CreditRedeemed(msg.sender, eff, ratePct, payout);
 
         if (payout > 0) _send(msg.sender, payout);
+    }
+
+    /// @notice Moves already-earned credits to `to` as a clean, provenance-free
+    ///         hop. effAtSend/trustAtSend are logged for reference only — not
+    ///         stored, not attached to the moved credits in any way.
+    function transferCredits(address to, uint256 amount, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external nonReentrant {
+        if (to == address(0)) revert ZeroAddress();
+        if (_acct[msg.sender].credits < amount) revert InsufficientCredits();
+
+        int256 effAtSend = SOS.effectiveOf(msg.sender);
+        uint256 trustAtSend = SOS.trustCountOf(msg.sender);
+
+        _acct[msg.sender].credits -= amount;
+        _acct[to].credits += amount;
+
+        SOS.recordSignature(msg.sender, to, payloadHash, signature, metadata);
+        emit CreditsTransferred(msg.sender, to, amount, effAtSend, trustAtSend);
+    }
+
+    // ───────────────────────────────────────────── GasClaim (minimal ERC20)
+    function gasClaimName() external pure returns (string memory) { return "GasClaim"; }
+    function gasClaimSymbol() external pure returns (string memory) { return "GASC"; }
+    function decimals() external pure returns (uint8) { return 18; }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        if (balanceOf[msg.sender] < amount) revert InsufficientBalance();
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        emit Transfer(msg.sender, to, amount);
+        return true;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        emit Approval(msg.sender, spender, amount);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        if (allowance[from][msg.sender] < amount) revert InsufficientAllowance();
+        if (balanceOf[from] < amount) revert InsufficientBalance();
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        emit Transfer(from, to, amount);
+        return true;
+    }
+
+    /// @notice Burns `amount` GasClaim and pays `amount` wei of ETH from the
+    ///         common pool. Capped by MIN_RESERVE, same guard as redeemCredit.
+    function redeemGasClaim(uint256 amount, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external nonReentrant {
+        if (balanceOf[msg.sender] < amount) revert InsufficientBalance();
+        if (address(this).balance < totalEarmarked + MIN_RESERVE + amount) revert PoolTooThin();
+
+        _burn(msg.sender, amount);
+        SOS.recordSignature(msg.sender, SOS69069_LEDGER, payloadHash, signature, metadata);
+        emit GasClaimRedeemed(msg.sender, amount);
+        _send(msg.sender, amount);
     }
 
     // ───────────────────────────────────────────── Views
@@ -267,5 +343,17 @@ contract dSOS {
     function _send(address to, uint256 amount) private {
         (bool ok, ) = to.call{value: amount}("");
         if (!ok) revert TransferFailed();
+    }
+
+    function _mint(address to, uint256 amount) private {
+        totalSupply += amount;
+        balanceOf[to] += amount;
+        emit Transfer(address(0), to, amount);
+    }
+
+    function _burn(address from, uint256 amount) private {
+        balanceOf[from] -= amount;
+        totalSupply -= amount;
+        emit Transfer(from, address(0), amount);
     }
 }
