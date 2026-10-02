@@ -2,6 +2,70 @@
 
 An ownerless ETH contract with three parallel offer instruments (B / T / P), a credit-based common pool, and a minimal embedded GasClaim token. Everything is gated by real signed records on the external **SOS69069** reputation ledger.
 
+```markdown
+## How SOS69069 dSOS works (User Guide)
+
+The contract has three main things you can do:
+
+### 1. Create or take an Offer (B / T / P)
+
+You can lock ETH into an **Offer**. There are three types, but they all work the same way on-chain:
+
+- **B-type** → “I lock ETH and want 1 SOS record from a *specific* person.”
+- **T-type** → “I lock ETH and want 1 Trust record from *anyone*.”
+- **P-type** → “I am willing to Push anyone who locks ETH for me.”
+
+**What happens:**
+1. Someone locks ETH and creates an offer (writes a SOS record at the same time).
+2. The offer can be freely transferred to other people.
+3. Whoever currently holds the offer can redeem it by writing the required SOS record → they receive the full locked ETH.
+4. Once created, an offer **can never be cancelled**. The original person who locked the ETH can never get it back.
+
+### 2. Earn and spend Credits
+
+- Every time your **Trust** count increases on the SOS69069 ledger, you earn 1 credit.
+- You can check your pending credits at any time.
+- You can transfer credits to other people (clean transfer, no history attached).
+- You can burn 1 credit to receive ETH from the common pool.
+
+**How much ETH you get for 1 credit** depends on your current `effective` score (Trust − Push). It follows a repeating cycle:
+
+- Starts at 30% of 0.006 ETH
+- Climbs up to 99% of 0.006 ETH
+- Then hits a “dead zone” that pays only ≈ $0.01
+- Then the cycle restarts at 30% again
+
+There is no minimum activity requirement and no reputation band you must be inside or outside of. Any effective score is allowed — you just get paid at a different rate.
+
+### 3. Donate to the Common Pool + GasClaim
+
+- Anyone can send ETH to the contract (plain transfer or `donateCommon`).
+- This ETH goes into the shared common pool.
+- Every time you donate a non-zero amount, you also receive 1 wei of a tiny token called **GasClaim**.
+- You can later burn GasClaim to get the same amount of ETH back from the pool (1:1).
+- Because gas fees are much higher than 1 wei, GasClaim has almost no practical value — it is mainly a receipt that you donated.
+
+### Important rules users should know
+
+- Everything important (creating offers, redeeming, transferring credits, etc.) requires a real signed SOS69069 record in the same transaction.
+- If the SOS record fails, the whole action is cancelled — no partial state changes.
+- The common pool can never go below a small safety reserve.
+- There is no owner, no admin, and no way to pause or upgrade the contract.
+- Offers are permanent once created. Credits and GasClaim can be moved or spent freely.
+
+### Simple summary
+
+| Action                        | What you do                          | What you get                          |
+|-------------------------------|--------------------------------------|---------------------------------------|
+| Create Offer                  | Lock ETH + write SOS record          | A transferable claim on that ETH      |
+| Redeem Offer                  | Write the required SOS record        | The full locked ETH                   |
+| Earn Credits                  | Increase your Trust on SOS69069      | 1 credit per new Trust                |
+| Spend Credit                  | Burn 1 credit                        | ETH (amount depends on your score)    |
+| Transfer Credits              | Send credits to someone else         | Clean transfer                        |
+| Donate                        | Send ETH to the contract             | 1 wei GasClaim + support the pool     |
+| Redeem GasClaim               | Burn GasClaim                        | Same amount of ETH back               |
+```
+
 dSOS does not issue a transferable ERC-20/721 token for the main contract — `name()`/`symbol()` exist purely for wallet display.  
 GasClaim is a separate minimal ERC20 embedded in the same contract.
 
