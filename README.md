@@ -2,7 +2,6 @@
 
 An ownerless ETH contract with three parallel offer instruments (B / T / P), a credit-based common pool, and a minimal embedded GasClaim token. Everything is gated by real signed records on the external **SOS69069** reputation ledger.
 
-```markdown
 ## How SOS69069 dSOS works (User Guide)
 
 The contract has three main things you can do:
@@ -64,7 +63,6 @@ There is no minimum activity requirement and no reputation band you must be insi
 | Transfer Credits              | Send credits to someone else         | Clean transfer                        |
 | Donate                        | Send ETH to the contract             | 1 wei GasClaim + support the pool     |
 | Redeem GasClaim               | Burn GasClaim                        | Same amount of ETH back               |
-```
 
 dSOS does not issue a transferable ERC-20/721 token for the main contract — `name()`/`symbol()` exist purely for wallet display.  
 GasClaim is a separate minimal ERC20 embedded in the same contract.
