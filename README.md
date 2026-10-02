@@ -135,4 +135,3 @@ Separately, the common pool pays out credits earned purely from trust activity, 
 A minimal GasClaim token is minted (1 wei) on every nonzero donation and can be redeemed 1:1 for ETH from the pool. Because gas costs dominate the 1-wei value, it has no practical farming value.
 
 The pool only grows from donations and only shrinks from credit or GasClaim payouts — nothing is ever reimbursed for gas, and nothing locked in an offer can ever be reclaimed by its original donor.
-```
