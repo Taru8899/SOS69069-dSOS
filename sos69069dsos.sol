@@ -50,6 +50,7 @@ contract dSOS {
     error TransferFailed();
     error Reentrant();
     error TooManyOffers();
+    error SelfTransfer();
 
     // STORAGE ==============================================================
 
@@ -110,8 +111,10 @@ contract dSOS {
 
     /// @notice Plain ETH top-up. Mints GasClaim only if value > 0. No ledger record.
     receive() external payable nonReentrant {
-        if (msg.value > 0) _mint(msg.sender, GAS_CLAIM_MINT);
-        emit Donation(msg.sender, msg.value);
+        if (msg.value > 0) {
+            _mint(msg.sender, GAS_CLAIM_MINT);
+            emit Donation(msg.sender, msg.value);
+        }
     }
 
     /// @notice Donates ETH to the pool with a donor -> ledger record. No offer minted.
@@ -189,8 +192,9 @@ contract dSOS {
     // CREDITS ==============================================================
 
     /// @notice Credits `user` 1 per new trust record since the last sync. Permissionless.
-    function syncCredits(address user) external returns (uint256 push, uint256 trust) {
-        (push, trust, , ) = _sync(user);
+    function syncCredits(address user) external returns (uint256 push, uint256 trust, uint256 credits) {
+        (push, trust, , credits) = _sync(user);
+        _acct[user].credits = credits;   // commit earned credits (fixes griefing vector)
     }
 
     /// @notice Burns 1 credit; pays according to the sawtooth rate.
@@ -215,9 +219,10 @@ contract dSOS {
     /// @notice Moves `amount` credits to `to`. Auto-syncs sender first.
     function transferCredits(address to, uint256 amount, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external nonReentrant {
         if (to == address(0)) revert ZeroAddress();
+        if (to == msg.sender) revert SelfTransfer();
         if (amount == 0) revert ZeroAmount();
 
-        // Option A: auto-sync sender so pending credits become transferable
+        // Auto-sync sender so pending credits become transferable
         (, , , uint256 credits) = _sync(msg.sender);
         if (credits < amount) revert InsufficientCredits();
 
