@@ -11,14 +11,13 @@ interface ISOS69069 {
 }
 
 /// @title SOS69069 dSOS
-/// @notice Ownerless. Three offer types (B/T/P), all non-cancellable once created,
-///         transferable, and redeemable in full by whoever currently holds them.
-///         Plus a credit pool with sawtooth rate. Credits from trust only, and
-///         transferable between accounts as clean, provenance-free hops.
-///         Plus GasClaim, a minimal ERC20 minting a fixed 1 wei to msg.sender on
-///         every receive()/donateCommon call, redeemable 1:1 for ETH.
-///         The common pool can only grow via receive()/donateCommon and can
-///         only shrink via redeemCredit and redeemGasClaim payouts.
+/// @notice Ownerless. Offers (B/T/P): non-cancellable, transferable, redeemed in
+///         full by the current holder. Credits: earned from trust only, spent at
+///         a sawtooth rate, transferable as clean provenance-free hops. GasClaim:
+///         minimal ERC20, mints a fixed 1 wei to msg.sender per nonzero
+///         receive()/donateCommon call, redeemable 1:1 for ETH. The common pool
+///         grows only via receive()/donateCommon and shrinks only via
+///         redeemCredit/redeemGasClaim payouts.
 contract dSOS {
     // ───────────────────────────────────────────── Constants
     address public constant SOS69069_LEDGER = 0x7373DBC24Dcd785896E8Ac3d5372c6ced9B75a8A;
@@ -31,10 +30,11 @@ contract dSOS {
     uint256 public constant BASE_RATE_PCT     = 30;
     uint256 public constant CYCLE_STEPS       = 71;
     uint256 public constant DEAD_ZONE_POS     = 70;
-    uint256 public constant GAS_CLAIM_MINT    = 1; // wei, fixed, per receive()/donateCommon call
+    uint256 public constant GAS_CLAIM_MINT    = 1; // wei, fixed, per nonzero donation call
 
     // ───────────────────────────────────────────── Errors
     error ZeroAddress();
+    error ZeroAmount();
     error InvalidValue();
     error OfferNotActive();
     error NotHolder();
@@ -99,11 +99,13 @@ contract dSOS {
     }
 
     // ───────────────────────────────────────────── Funding
+    /// @notice Plain ETH top-up. Mints GasClaim only if value > 0. No ledger record.
     receive() external payable {
-        _mint(msg.sender, GAS_CLAIM_MINT);
+        if (msg.value > 0) _mint(msg.sender, GAS_CLAIM_MINT);
         emit Donation(msg.sender, msg.value);
     }
 
+    /// @notice Donates ETH to the pool with a donor -> ledger record. No offer minted.
     function donateCommon(bytes32 payloadHash, bytes calldata signature, string calldata metadata) external payable nonReentrant {
         if (msg.value == 0) revert InvalidValue();
         _mint(msg.sender, GAS_CLAIM_MINT);
@@ -112,6 +114,7 @@ contract dSOS {
     }
 
     // ───────────────────────────────────────────── Offers
+    /// @notice Locks msg.value for `to`, atomic with a donor -> to record. Non-cancellable.
     function createOffer(
         OfferType kind,
         address to,
@@ -140,6 +143,7 @@ contract dSOS {
         emit OfferCreated(id, kind, msg.sender, to, msg.value);
     }
 
+    /// @notice Transfers an offer to a new holder. Current holder only.
     function transferOffer(uint256 id, address to, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external nonReentrant {
         Offer storage o = _offers[id];
         if (!o.active) revert OfferNotActive();
@@ -154,6 +158,7 @@ contract dSOS {
         emit OfferTransferred(id, msg.sender, to);
     }
 
+    /// @notice Redeems an offer. Current holder only. Record targets the original donor.
     function redeemOffer(uint256 id, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external nonReentrant {
         Offer storage o = _offers[id];
         if (!o.active) revert OfferNotActive();
@@ -172,10 +177,12 @@ contract dSOS {
     }
 
     // ───────────────────────────────────────────── Credits
+    /// @notice Credits `user` 1 per new trust record since the last sync.
     function syncCredits(address user) external returns (uint256 push, uint256 trust) {
         (push, trust, , ) = _sync(user);
     }
 
+    /// @notice Burns 1 credit; pays UNIT * sawtooth-rate(effectiveOf(caller)) / 100.
     function redeemCredit(bytes32 payloadHash, bytes calldata signature, string calldata metadata) external nonReentrant {
         (, , int256 eff, uint256 credits) = _sync(msg.sender);
         if (credits == 0) revert NoCredit();
@@ -192,11 +199,10 @@ contract dSOS {
         if (payout > 0) _send(msg.sender, payout);
     }
 
-    /// @notice Moves already-earned credits to `to` as a clean, provenance-free
-    ///         hop. effAtSend/trustAtSend are logged for reference only — not
-    ///         stored, not attached to the moved credits in any way.
+    /// @notice Moves `amount` credits to `to`, a clean hop with no stored provenance.
     function transferCredits(address to, uint256 amount, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external nonReentrant {
         if (to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
         if (_acct[msg.sender].credits < amount) revert InsufficientCredits();
 
         int256 effAtSend = SOS.effectiveOf(msg.sender);
@@ -238,9 +244,9 @@ contract dSOS {
         return true;
     }
 
-    /// @notice Burns `amount` GasClaim and pays `amount` wei of ETH from the
-    ///         common pool. Capped by MIN_RESERVE, same guard as redeemCredit.
+    /// @notice Burns `amount` GasClaim; pays `amount` wei from the common pool.
     function redeemGasClaim(uint256 amount, bytes32 payloadHash, bytes calldata signature, string calldata metadata) external nonReentrant {
+        if (amount == 0) revert ZeroAmount();
         if (balanceOf[msg.sender] < amount) revert InsufficientBalance();
         if (address(this).balance < totalEarmarked + MIN_RESERVE + amount) revert PoolTooThin();
 
